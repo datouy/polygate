@@ -10,14 +10,15 @@
   <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB.svg?logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/OpenAI-Compatible-412991.svg?logo=openai&logoColor=white" alt="OpenAI Compatible">
   <img src="https://img.shields.io/badge/FastAPI-0.110%2B-009688.svg?logo=fastapi&logoColor=white" alt="FastAPI">
+  <img src="https://img.shields.io/badge/tests-25%20passed-brightgreen" alt="tests">
   <img src="https://img.shields.io/github/stars/datouy/polygate?style=social" alt="GitHub stars">
 </p>
 
 ---
 
-> **一句话简介 / One-liner**：一把钥匙，接入 DeepSeek / 通义千问 / 智谱 GLM / Kimi / OpenAI —— OpenAI 兼容、多 Key 轮询、故障自动切换、限流熔断、成本记账、可观测与请求重放，开箱即用。
+> **一句话简介 / One-liner**：一把钥匙，接入 DeepSeek / 通义千问 / 智谱 GLM / Kimi / OpenAI —— OpenAI 兼容、多 Key 轮询、故障自动切换、限流熔断、成本记账、可观测、请求重放，以及面板内在线改配置（不改 yaml），开箱即用。
 >
-> *One key, every model. An OpenAI-compatible gateway for DeepSeek / Qwen / GLM / Kimi / OpenAI with multi-key rotation, automatic failover, rate limiting & circuit breaking, cost accounting, observability and request replay.*
+> *One key, every model. An OpenAI-compatible gateway for DeepSeek / Qwen / GLM / Kimi / OpenAI with multi-key rotation, automatic failover, rate limiting & circuit breaking, cost accounting, observability, request replay, and live config editing in the admin panel.*
 
 ---
 
@@ -79,6 +80,9 @@ POLYGATE_PORT=8000 POLYGATE_CONFIG=config.yaml python run.py
 
 打开 `http://127.0.0.1:8000/docs` 查看交互式 API 文档。· Open `http://127.0.0.1:8000/docs` for the interactive API docs.
 
+> 💡 配置加载顺序：`POLYGATE_CONFIG` 环境变量 → `config.yaml`（存在则优先）→ `config.example.yaml`。
+> 也可以启动后打开 `http://127.0.0.1:8000/admin`，在面板里**在线改 URL / Key**（存 SQLite，不改 `config.yaml`，保存即生效）。
+
 ---
 
 ## ⚙️ 配置 · Configuration
@@ -86,7 +90,7 @@ POLYGATE_PORT=8000 POLYGATE_CONFIG=config.yaml python run.py
 `config.example.yaml` 结构 · Structure：
 
 ```yaml
-db_path: polygate.db             # SQLite 持久化（留空禁用）· SQLite persistence (empty = disabled)
+db_path: polygate.db             # SQLite：用量持久化 + 配置覆盖（留空则禁用）· persistence & config overrides
 auth:
   api_key: "change-me"           # 网关入口密钥 · gateway key
   admin_key: ""                  # 管理端口密钥（留空复用 api_key）· admin key
@@ -145,6 +149,23 @@ models:
 | Moonshot Kimi | `https://api.moonshot.cn/v1` |
 | OpenAI | `https://api.openai.com/v1` |
 | 任意 OpenAI 兼容服务（vLLM/Ollama/one-api 等） | 自定义 · custom |
+
+---
+
+## 🖥 管理面板 · Admin Panel
+
+启动后打开 `http://127.0.0.1:8000/admin`（默认口令 `change-me`，生产请改 `auth.admin_key`）：
+
+| 区域 | 能做什么 |
+|---|---|
+| Providers | 查看熔断状态、连续失败次数、Key 数、限流配置 |
+| Models | 查看「模型 → Provider」的路由映射 |
+| 实时用量 / 每日历史 | 调用数、错误数、token、延迟 |
+| 成本 | 按 Key / 模型汇总成本 |
+| 最近请求 | 端点、模型、状态、延迟（可配合 API 重放） |
+| **⚙️ 配置** | **改每个 Provider 的 base_url / API Key；新增 Provider（含官方预设）；保存即热重载；支持一键重置回 yaml** |
+
+> 🔒 Key 永远只显示脱敏值（如 `c58d...f9db`），面板和接口都不会返回明文。
 
 ---
 
@@ -230,6 +251,16 @@ polygate/
 │   ├── client.py          # Python 客户端示例 · client example
 │   └── curl.sh            # curl 示例 · curl example
 └── tests/                 # 测试 · tests
+    ├── test_core.py         # 路由 / 配置展开 / 统计
+    ├── test_ratelimit.py    # 内存令牌桶限流
+    ├── test_redislimiter.py # Redis 限流（不可用时自动跳过）
+    ├── test_circuit.py      # 熔断三态迁移
+    ├── test_store.py        # SQLite 用量持久化
+    ├── test_metrics.py      # Prometheus 指标
+    ├── test_cost.py         # 成本记账
+    ├── test_requestlog.py   # 请求日志
+    ├── test_config_api.py   # 在线配置读写 / 热重载 / yaml 不变
+    └── test_e2e.py          # 端到端（Mock 上游）
 ```
 
 ---
@@ -241,9 +272,11 @@ pip install pytest
 python -m pytest -q
 ```
 
-覆盖：配置展开、路由/故障切换、限流（内存/Redis）、熔断三态、SQLite 持久化、Prometheus 指标、成本记账、请求日志与重放，以及 Mock 上游下的非流式 + 流式 + Embeddings + 语音转写端到端流程。
+覆盖：配置展开、路由/故障切换、限流（内存/Redis）、熔断三态、SQLite 持久化、Prometheus 指标、成本记账、请求日志与重放、**在线配置读写与热重载（SQLite 覆盖、yaml 不变）**，以及 Mock 上游下的非流式 + 流式 + Embeddings + 语音转写端到端流程。
 
-*Covers: config expansion, routing/failover, rate limiting (memory/Redis), circuit-breaker states, SQLite persistence, Prometheus metrics, cost accounting, request logging & replay, and end-to-end chat (streaming & non-streaming), embeddings and transcription against a mock upstream.*
+当前结果：**25 passed, 1 skipped**（跳过项是本机 Redis 需要密码，自动跳过）。
+
+*Covers: config expansion, routing/failover, rate limiting (memory/Redis), circuit-breaker states, SQLite persistence, Prometheus metrics, cost accounting, request logging & replay, live config editing with hot reload (SQLite overrides, yaml untouched), and end-to-end chat (streaming & non-streaming), embeddings and transcription against a mock upstream.*
 
 ---
 
@@ -259,6 +292,7 @@ python -m pytest -q
 - [x] Prometheus 指标 · Metrics
 - [x] `/v1/audio/transcriptions` 转发 · Transcription
 - [x] Redis 分布式限流 · Distributed rate limiting
+- [x] 管理面板在线改配置（SQLite 覆盖，yaml 只读）· Live config editing
 - [ ] 请求日志保留天数自动清理 · log retention cleanup
 - [ ] 更多语音接口（翻译/tts）· more audio endpoints (translation/tts)
 - [ ] Docker 镜像与 docker-compose · Docker image & compose
