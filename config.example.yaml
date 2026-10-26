@@ -2,11 +2,21 @@
 # 复制为 config.yaml 后填写你自己的 Key（config.yaml 已被 .gitignore 忽略，不会泄露）
 # 环境变量用 ${NAME} 引用，例如 ${DEEPSEEK_API_KEY}
 
+# SQLite 用量持久化（留空或删除则禁用持久化）
+db_path: polygate.db
+
 auth:
   # 保护你的网关入口。设置后，客户端必须带请求头 Authorization: Bearer <api_key>
   api_key: "change-me"
-  # /v1/usage 管理端口独立密钥（留空则复用 api_key）
+  # /v1/usage、/v1/status、/admin 等管理端口的独立密钥（留空则复用 api_key）
   admin_key: ""
+
+# 健康检查与熔断
+health:
+  enabled: true
+  interval: 30          # 健康检查间隔（秒）
+  failure_threshold: 3  # 连续失败 N 次后熔断
+  cooldown: 60          # 熔断后冷却多久进入半开探测（秒）
 
 providers:
   deepseek:
@@ -15,6 +25,8 @@ providers:
     # 多 Key 自动轮询（可选，会与 api_key 合并轮换）
     api_keys: []
     timeout: 120
+    # 令牌桶限流：每秒最多 rate 个请求，突发 burst（可选）
+    rate_limit: { rate: 10, burst: 20 }
 
   qwen:
     base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
@@ -62,3 +74,14 @@ models:
     providers:
       - { provider: deepseek, model: deepseek-chat, weight: 3 }
       - { provider: qwen, model: qwen-plus, weight: 1 }
+
+  # Embeddings 模型（kind: embeddings，走 /v1/embeddings 统一转发）
+  - name: qwen-text-embedding-v3
+    kind: embeddings
+    providers:
+      - { provider: qwen, model: text-embedding-v3 }
+
+  - name: glm-embedding-3
+    kind: embeddings
+    providers:
+      - { provider: zhipu, model: embedding-3 }

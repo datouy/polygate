@@ -19,6 +19,17 @@ class Provider:
             return base
         return f"{base}/chat/completions"
 
+    @property
+    def embeddings_url(self) -> str:
+        base = self.base_url.rstrip("/")
+        if base.endswith("/embeddings"):
+            return base
+        return f"{base}/embeddings"
+
+    @property
+    def models_url(self) -> str:
+        return f"{self.base_url.rstrip('/')}/models"
+
     def headers(self, api_key: str) -> dict:
         headers = {"Content-Type": "application/json"}
         if api_key:

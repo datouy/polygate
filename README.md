@@ -1,7 +1,8 @@
 # polygate · 国产大模型统一 API 网关
 
 > 一把钥匙，接入 DeepSeek / 通义千问 / 智谱 GLM / Kimi / OpenAI。
-> 纯 Python + FastAPI，OpenAI 兼容，支持多 Key 轮询、按权重负载均衡、故障自动切换、流式透传与用量统计。
+> 纯 Python + FastAPI，OpenAI 兼容，支持多 Key 轮询、权重负载均衡、故障自动切换、流式透传、
+> 令牌桶限流、熔断器、SQLite 用量持久化、Embeddings 转发与内置管理面板。
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
@@ -26,7 +27,12 @@
 | 权重负载均衡 | 同一模型配多个 Provider，按 weight 加权随机 |
 | 故障自动切换 | 连接错误 / 429 / 5xx 自动尝试下一个候选；4xx 不重试 |
 | 流式透传 | SSE 原样转发，自动注入 `stream_options.include_usage` |
+| Embeddings 转发 | `/v1/embeddings` 统一转发到各家的 embedding 模型 |
 | 用量统计 | 按模型/Provider 记录调用数、错误数、token、延迟 |
+| SQLite 持久化 | 每次调用落库，支持按日汇总查询 |
+| 令牌桶限流 | 按 Provider + Key 维度限流（rate/burst） |
+| 熔断器 | 连续失败自动熔断，冷却后半开放行单个探测，自动恢复 |
+| Web 管理面板 | `/admin` 实时查看 Provider 状态、模型、用量、每日历史 |
 | 网关鉴权 | 用你自己的 Key 保护入口，不暴露上游 Key |
 
 ---
@@ -59,17 +65,23 @@ POLYGATE_PORT=8000 POLYGATE_CONFIG=config.yaml python run.py
 `config.example.yaml` 结构：
 
 ```yaml
+db_path: polygate.db             # SQLite 持久化（留空则禁用）
 auth:
-  api_key: "change-me"        # 网关入口密钥，客户端需带 Authorization: Bearer <此值>
+  api_key: "change-me"           # 网关入口密钥，客户端需带 Authorization: Bearer <此值>
+  admin_key: ""                  # 管理端口密钥（留空复用 api_key）
+
+health:                          # 健康检查与熔断
+  enabled: true
+  interval: 30                   # 检查间隔（秒）
+  failure_threshold: 3           # 连续失败 N 次后熔断
+  cooldown: 60                   # 熔断冷却（秒）
 
 providers:
   deepseek:
     base_url: https://api.deepseek.com
     api_key: ${DEEPSEEK_API_KEY}   # 支持环境变量引用
     api_keys: []                    # 多 Key 轮询（可选）
-  qwen:
-    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-    api_key: ${DASHSCOPE_API_KEY}
+    rate_limit: { rate: 10, burst: 20 }   # 令牌桶限流（可选）
 
 models:
   - name: deepseek-chat           # 对外暴露的模型名
@@ -80,6 +92,11 @@ models:
     providers:
       - { provider: deepseek, model: deepseek-chat, weight: 3 }
       - { provider: qwen, model: qwen-plus, weight: 1 }
+
+  - name: qwen-text-embedding-v3  # Embeddings 模型
+    kind: embeddings
+    providers:
+      - { provider: qwen, model: text-embedding-v3 }
 ```
 
 ### 各 Provider 官方 OpenAI 兼容地址
@@ -105,7 +122,11 @@ models:
 | GET | `/v1/models` | 列出配置的模型 |
 | POST | `/v1/chat/completions` | 对话（支持 `stream: true`） |
 | POST | `/v1/completions` | 旧版补全（自动转 chat） |
-| GET | `/v1/usage` | 用量统计 |
+| POST | `/v1/embeddings` | 向量化（统一转发） |
+| GET | `/v1/status` | Provider 熔断/限流状态（需 admin key） |
+| GET | `/v1/usage` | 实时用量统计（需 admin key） |
+| GET | `/v1/usage/history?days=7` | 每日用量历史（需 admin key） |
+| GET | `/admin` | Web 管理面板 |
 
 ### 用 openai 官方 SDK 调用
 
@@ -144,9 +165,13 @@ polygate/
 ├── polygate/
 │   ├── server.py          # FastAPI 应用与路由
 │   ├── config.py          # 配置加载 + 环境变量展开
-│   ├── providers.py       # Provider 抽象
+│   ├── providers.py       # Provider 抽象（chat/embeddings/models）
 │   ├── router.py          # 权重路由 / 多 Key 轮询 / 故障切换候选
-│   ├── stats.py           # 用量统计
+│   ├── stats.py           # 内存用量统计
+│   ├── store.py           # SQLite 用量持久化
+│   ├── ratelimit.py       # 令牌桶限流
+│   ├── circuit.py         # 熔断器（closed/open/half_open）
+│   ├── admin.py           # Web 管理面板（单文件 HTML）
 │   ├── schemas.py         # 请求模型
 │   └── errors.py          # 异常与重试策略
 ├── examples/
@@ -154,6 +179,9 @@ polygate/
 │   └── curl.sh            # curl 示例
 └── tests/
     ├── test_core.py       # 核心逻辑单测
+    ├── test_ratelimit.py  # 限流单测
+    ├── test_circuit.py    # 熔断单测
+    ├── test_store.py      # 持久化单测
     └── test_e2e.py        # 端到端测试（Mock 上游）
 ```
 
@@ -166,19 +194,23 @@ pip install pytest
 python -m pytest -q
 ```
 
-测试覆盖：配置环境变量展开、路由权重/故障切换候选、无 Key Provider 跳过、重试策略、用量统计，
-以及本地 Mock 上游下的完整非流式 + 流式端到端流程。
+测试覆盖：配置环境变量展开、路由权重/故障切换候选、无 Key Provider 跳过、重试策略、令牌桶限流、
+熔断器三态迁移、SQLite 持久化与按日汇总，以及本地 Mock 上游下的完整非流式 + 流式 + Embeddings 端到端流程。
 
 ---
 
 ## 路线图（Roadmap）
 
-- [ ] 持久化用量统计（SQLite）
-- [ ] 按 Key / 模型限流（令牌桶）
-- [ ] 上游健康检查与自动熔断（circuit breaker）
+- [x] 持久化用量统计（SQLite）
+- [x] 按 Key / Provider 限流（令牌桶）
+- [x] 上游健康检查与自动熔断（circuit breaker）
+- [x] 支持 `/v1/embeddings` 统一转发
+- [x] 简单的 Web 管理面板
 - [ ] 请求日志与重放
-- [ ] 支持 `/v1/embeddings` 统一转发
-- [ ] 简单的 Web 管理面板
+- [ ] 按 Key 记账与成本估算（结合各家 token 单价）
+- [ ] 上游健康检查与自动熔断的 Prometheus 指标导出
+- [ ] `/v1/audio/transcriptions` 语音转写转发
+- [ ] 多进程/分布式限流（Redis 后端）
 
 ---
 

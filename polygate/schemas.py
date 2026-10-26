@@ -1,4 +1,4 @@
-"""请求模型（OpenAI Chat Completions 格式，其余字段透传）。"""
+"""请求模型（OpenAI 兼容格式，其余字段透传）。"""
 
 from __future__ import annotations
 
@@ -19,3 +19,10 @@ class ChatRequest(BaseModel):
     stop: Any = None
     tools: Any = None
     tool_choice: Any = None
+
+
+class EmbeddingsRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    model: str
+    input: Any
