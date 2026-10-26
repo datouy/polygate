@@ -46,6 +46,33 @@ th{color:var(--muted);font-weight:500}
   <section class="card"><h2>每日历史</h2><table id="history"><thead><tr><th>日期</th><th>调用</th><th>错误</th><th>Tokens</th></tr></thead><tbody></tbody></table></section>
   <section class="card"><h2>成本</h2><div id="cost-total" class="muted"></div><table id="costs"><thead><tr><th>Key</th><th>成本</th><th>调用</th><th>Tokens</th></tr></thead><tbody></tbody></table></section>
   <section class="card"><h2>最近请求</h2><table id="requests"><thead><tr><th>端点</th><th>模型</th><th>Provider</th><th>状态</th><th>延迟</th></tr></thead><tbody></tbody></table></section>
+  <section class="card" style="grid-column:1/-1">
+    <h2>⚙️ 配置 · 在线修改（保存后热重载，无需重启）</h2>
+    <table id="cfg-providers"><thead><tr><th style="width:130px">Provider</th><th>Base URL</th><th>API Key（留空 = 不改）</th><th style="width:45px">Key</th></tr></thead><tbody></tbody></table>
+    <div class="toolbar" style="margin-top:12px">
+      <button onclick="saveConfig()">保存全部</button>
+      <span id="cfg-msg" class="muted"></span>
+    </div>
+    <hr style="border:0;border-top:1px solid var(--border);margin:16px 0">
+    <h2>➕ 新增 Provider</h2>
+    <div class="toolbar" style="flex-wrap:wrap">
+      <input id="new-name" placeholder="名称，如 deepseek" style="width:150px">
+      <select id="new-preset" onchange="fillPreset()" style="background:#0a0c0f;border:1px solid var(--border);color:var(--fg);border-radius:6px;padding:5px 8px;font-size:13px">
+        <option value="">选择预设…</option>
+        <option value="deepseek">DeepSeek</option>
+        <option value="qwen">通义千问</option>
+        <option value="zhipu">智谱 GLM</option>
+        <option value="moonshot">Kimi</option>
+        <option value="openai">OpenAI</option>
+        <option value="custom">自定义</option>
+      </select>
+      <input id="new-url" placeholder="https://.../v1" style="width:300px">
+      <input id="new-key" type="password" placeholder="API Key">
+      <input id="new-model" placeholder="可选：模型名" style="width:130px">
+      <button onclick="addProvider()">添加</button>
+    </div>
+    <p class="muted" style="margin:8px 0 0">提示：填了「模型名」会自动创建一条 chat 模型映射，添加后即可直接调用。</p>
+  </section>
 </main>
 <script>
 function k(){return localStorage.getItem('polygate_key')||'change-me';}
@@ -97,7 +124,63 @@ async function refresh(){
     st.className='ok';
   }catch(e){st.textContent='连接失败: '+e.message;st.className='err';}
 }
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];});}
+let PRESETS={};
+async function loadConfig(){
+  try{
+    const cfg=await getJSON('/v1/config');
+    PRESETS=cfg.presets||{};
+    const tb=document.querySelector('#cfg-providers tbody');tb.innerHTML='';
+    for(const [name,p] of Object.entries(cfg.providers)){
+      const ph=p.has_key?('已设置 '+p.key_hint):'未设置';
+      tb.insertAdjacentHTML('beforeend','<tr><td>'+esc(name)+'</td>'
+        +'<td><input class="cfg-url" data-name="'+esc(name)+'" value="'+esc(p.base_url)+'" style="width:100%"></td>'
+        +'<td><input class="cfg-key" data-name="'+esc(name)+'" type="password" placeholder="'+esc(ph)+'" style="width:100%"></td>'
+        +'<td class="muted">'+(p.has_key?'✓':'—')+'</td></tr>');
+    }
+  }catch(e){const m=document.getElementById('cfg-msg');if(m){m.textContent='配置加载失败: '+e.message;m.style.color='var(--red)';}}
+}
+async function putConfig(payload){
+  const r=await fetch('/v1/config',{method:'PUT',headers:Object.assign({'Content-Type':'application/json'},H()),body:JSON.stringify(payload)});
+  if(!r.ok){throw new Error(await r.text());}
+  return r.json();
+}
+async function saveConfig(){
+  const msg=document.getElementById('cfg-msg');
+  try{
+    const providers={};
+    document.querySelectorAll('.cfg-url').forEach(function(inp){providers[inp.dataset.name]={base_url:inp.value};});
+    document.querySelectorAll('.cfg-key').forEach(function(inp){if(inp.value){providers[inp.dataset.name]=providers[inp.dataset.name]||{};providers[inp.dataset.name].api_key=inp.value;}});
+    await putConfig({providers:providers});
+    msg.textContent='已保存并热重载 ✓';msg.style.color='var(--green)';
+    await loadConfig();refresh();
+  }catch(e){msg.textContent='保存失败: '+e.message;msg.style.color='var(--red)';}
+}
+function fillPreset(){
+  const v=document.getElementById('new-preset').value;
+  const urlEl=document.getElementById('new-url');
+  if(v==='custom'){urlEl.value='';return;}
+  if(PRESETS[v]){urlEl.value=PRESETS[v];}
+}
+async function addProvider(){
+  const name=document.getElementById('new-name').value.trim();
+  const url=document.getElementById('new-url').value.trim();
+  const key=document.getElementById('new-key').value;
+  const model=document.getElementById('new-model').value.trim();
+  const msg=document.getElementById('cfg-msg');
+  if(!name||!url){msg.textContent='请填写名称和 URL';msg.style.color='var(--red)';return;}
+  try{
+    const providers={};providers[name]={base_url:url};if(key){providers[name].api_key=key;}
+    const payload={providers:providers};
+    if(model){payload.models=[{name:model,kind:'chat',providers:[{provider:name,model:model}]}];}
+    await putConfig(payload);
+    msg.textContent='已添加 '+name+(model?(' + 模型 '+model):'')+' ✓';msg.style.color='var(--green)';
+    document.getElementById('new-name').value='';document.getElementById('new-url').value='';document.getElementById('new-key').value='';document.getElementById('new-model').value='';
+    await loadConfig();refresh();
+  }catch(e){msg.textContent='添加失败: '+e.message;msg.style.color='var(--red)';}
+}
 refresh();
+loadConfig();
 setInterval(refresh,5000);
 </script>
 </body>

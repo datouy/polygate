@@ -2,7 +2,8 @@
 
 统一 /v1/chat/completions、/v1/embeddings、/v1/audio/transcriptions，
 支持流式透传、多 Key 轮询、权重负载均衡、故障切换、令牌桶限流（内存/Redis）、
-熔断器、SQLite 持久化、请求日志与重放、按 Key 成本记账、Prometheus 指标与管理面板。
+熔断器、SQLite 持久化、请求日志与重放、按 Key 成本记账、Prometheus 指标与管理面板，
+并支持在管理面板中在线修改配置（base_url / api_key）后热重载，无需重启。
 """
 
 from __future__ import annotations
@@ -20,16 +21,13 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from . import __version__
 from .admin import ADMIN_HTML
-from .circuit import CircuitBreaker
-from .config import load_config
+from .config import load_config, save_config
 from .cost import CostTracker, compute_cost
 from .errors import UpstreamError, is_retryable
 from .metrics import Metrics
-from .providers import Provider
-from .ratelimit import RateLimiter
-from .redislimiter import RedisRateLimiter
 from .requestlog import RequestLog
-from .router import Candidate, Route, Router
+from .router import Candidate
+from .runtime import RuntimeState, mask_key
 from .schemas import ChatRequest, EmbeddingsRequest
 from .stats import Stats
 from .store import UsageStore
@@ -40,67 +38,6 @@ _metrics = Metrics()
 _store: Optional[UsageStore] = None
 _reqlog: Optional[RequestLog] = None
 _cost: Optional[CostTracker] = None
-
-
-def _key_label(key: str) -> str:
-    if not key:
-        return ""
-    if len(key) <= 8:
-        return "****"
-    return f"{key[:4]}...{key[-4:]}"
-
-
-def _build(cfg: dict):
-    providers: dict[str, Provider] = {}
-    for name, p in (cfg.get("providers") or {}).items():
-        base_url = p.get("base_url")
-        if not base_url:
-            continue
-        keys = list(p.get("api_keys") or [])
-        if p.get("api_key"):
-            keys.insert(0, p["api_key"])
-        keys = [k for k in keys if k]
-        providers[name] = Provider(
-            name=name,
-            base_url=base_url,
-            api_keys=keys,
-            timeout=float(p.get("timeout", 120.0)),
-        )
-
-    models: dict[str, list[Route]] = {}
-    model_kinds: dict[str, str] = {}
-    for m in (cfg.get("models") or []):
-        name = m.get("name")
-        routes = [
-            Route(
-                provider=r.get("provider"),
-                model=r.get("model"),
-                weight=float(r.get("weight", 1.0)),
-            )
-            for r in (m.get("providers") or [])
-            if r.get("provider") and r.get("model")
-        ]
-        if name and routes:
-            models[name] = routes
-            model_kinds[name] = m.get("kind", "chat")
-
-    rate_limits: dict[str, tuple[float, float]] = {}
-    for name, p in (cfg.get("providers") or {}).items():
-        rl = p.get("rate_limit")
-        if rl:
-            rate_limits[name] = (float(rl.get("rate", 10.0)), float(rl.get("burst", 10.0)))
-
-    pricing = cfg.get("pricing") or {}
-    return providers, models, model_kinds, rate_limits, pricing
-
-
-def _build_limiter(redis_cfg):
-    if not redis_cfg or not redis_cfg.get("url"):
-        return RateLimiter()
-    try:
-        return RedisRateLimiter(redis_cfg["url"])
-    except Exception:
-        return RateLimiter()
 
 
 def _resolve_config_path(config):
@@ -120,36 +57,21 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
 
     if isinstance(config, dict):
         cfg = config
+        config_path: Optional[str] = None
     else:
-        path = _resolve_config_path(config)
-        cfg = load_config(path)
+        config_path = _resolve_config_path(config)
+        cfg = load_config(config_path)
 
-    providers, models, model_kinds, rate_limits, pricing = _build(cfg)
-    router = Router(providers, models)
-    auth = cfg.get("auth") or {}
-    gateway_key = auth.get("api_key") or None
-    admin_key = auth.get("admin_key") or gateway_key
-
-    health_cfg = cfg.get("health") or {}
-    health_enabled = bool(health_cfg.get("enabled", True))
-    health_interval = float(health_cfg.get("interval", 30.0))
-    circuits: dict[str, CircuitBreaker] = {
-        name: CircuitBreaker(
-            failure_threshold=int(health_cfg.get("failure_threshold", 3)),
-            cooldown_sec=float(health_cfg.get("cooldown", 60.0)),
-        )
-        for name in providers
-    }
-    limiter = _build_limiter(cfg.get("redis"))
-
+    state = RuntimeState(cfg)
     db_path = cfg.get("db_path", "polygate.db") or None
 
+    # ---------- 记录与日志 ----------
     def _record_stats(model, provider, status, prompt=0, completion=0, latency_ms=0.0, key_label=None):
         _stats.record(model, provider, status, prompt, completion, latency_ms)
         if _store is not None:
             _store.record(model, provider, status, prompt, completion, latency_ms)
         if _cost is not None and status == "ok" and key_label:
-            cost = compute_cost(prompt, completion, pricing, model)
+            cost = compute_cost(prompt, completion, state.pricing, model)
             if cost > 0:
                 _cost.add(key_label, model, prompt, completion, cost)
         _metrics.inc("polygate_requests_total", {"model": model, "provider": provider, "status": status})
@@ -167,22 +89,15 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
             return
         try:
             _reqlog.log(
-                req_id=ctx["req_id"],
-                endpoint=ctx["endpoint"],
-                model=model_name,
-                provider=provider,
-                key_label=key_label,
-                status=status,
-                status_code=status_code,
-                latency_ms=latency,
-                request=request,
-                response=response,
-                error=error,
+                req_id=ctx["req_id"], endpoint=ctx["endpoint"], model=model_name, provider=provider,
+                key_label=key_label, status=status, status_code=status_code, latency_ms=latency,
+                request=request, response=response, error=error,
             )
         except Exception:
             pass
 
-    async def _ping_provider(prov: Provider) -> bool:
+    # ---------- 健康检查 ----------
+    async def _ping_provider(prov) -> bool:
         if not prov.api_keys:
             return False
         try:
@@ -193,13 +108,17 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
 
     async def _health_loop():
         while True:
-            await asyncio.sleep(health_interval)
-            for name, prov in providers.items():
+            await asyncio.sleep(max(5.0, state.health_interval))
+            if not state.health_enabled:
+                continue
+            for name, prov in list(state.providers.items()):
                 ok = await _ping_provider(prov)
-                if ok:
-                    circuits[name].record_success()
-                else:
-                    circuits[name].record_failure()
+                circuit = state.circuits.get(name)
+                if circuit is not None:
+                    if ok:
+                        circuit.record_success()
+                    else:
+                        circuit.record_failure()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -212,12 +131,11 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
             _store = UsageStore(db_path)
             _reqlog = RequestLog(db_path)
             _cost = CostTracker(db_path)
-        health_task = asyncio.create_task(_health_loop()) if health_enabled else None
+        health_task = asyncio.create_task(_health_loop())
         try:
             yield
         finally:
-            if health_task:
-                health_task.cancel()
+            health_task.cancel()
             await _client.aclose()
             _client = None
             for obj in (_store, _reqlog, _cost):
@@ -232,20 +150,24 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
         lifespan=lifespan,
     )
 
+    # ---------- 鉴权 ----------
     def _check_auth(request: Request) -> None:
-        if not gateway_key:
+        key = state.gateway_key
+        if not key:
             return
-        if request.headers.get("authorization", "") != f"Bearer {gateway_key}":
+        if request.headers.get("authorization", "") != f"Bearer {key}":
             raise HTTPException(status_code=401, detail="invalid gateway api key")
 
     def _check_admin(request: Request) -> None:
-        if admin_key and request.headers.get("authorization", "") != f"Bearer {admin_key}":
+        key = state.admin_key
+        if key and request.headers.get("authorization", "") != f"Bearer {key}":
             raise HTTPException(status_code=401, detail="invalid admin key")
 
+    # ---------- 上游转发 ----------
     async def _forward_nonstream(cand: Candidate, payload: dict, model_name: str, url: str, ctx: dict) -> dict:
         start = time.time()
         headers = cand.provider.headers(cand.api_key)
-        key_label = _key_label(cand.api_key)
+        key_label = mask_key(cand.api_key)
         try:
             resp = await _client.post(url, json=payload, headers=headers)
         except httpx.HTTPError as exc:
@@ -273,7 +195,7 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
     async def _stream(cand: Candidate, payload: dict, model_name: str, ctx: dict):
         start = time.time()
         headers = cand.provider.headers(cand.api_key)
-        key_label = _key_label(cand.api_key)
+        key_label = mask_key(cand.api_key)
         req = _client.build_request("POST", cand.provider.chat_url, json=payload, headers=headers)
         try:
             resp = await _client.send(req, stream=True)
@@ -303,7 +225,7 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
 
     async def _forward_transcription(cand: Candidate, model_name: str, content: bytes, filename: str, content_type: str, extra: dict, ctx: dict):
         start = time.time()
-        key_label = _key_label(cand.api_key)
+        key_label = mask_key(cand.api_key)
         headers = {}
         if cand.api_key:
             headers["Authorization"] = f"Bearer {cand.api_key}"
@@ -331,30 +253,31 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
         return data
 
     async def _try_all(cands: list[Candidate], model_name: str, fn):
-        """按候选顺序尝试；处理熔断、限流、故障切换。"""
         last: Optional[UpstreamError] = None
         attempted = False
         rate_limited = False
         circuit_open = False
         for cand in cands:
-            if not circuits[cand.provider_name].allow():
+            circuit = state.circuits.get(cand.provider_name)
+            if circuit is not None and not circuit.allow():
                 circuit_open = True
                 continue
-            rl = rate_limits.get(cand.provider_name)
+            rl = state.rate_limits.get(cand.provider_name)
             if rl:
-                ok = await asyncio.to_thread(limiter.allow, f"{cand.provider_name}:{cand.api_key}", rl[0], rl[1])
+                ok = await asyncio.to_thread(state.limiter.allow, f"{cand.provider_name}:{cand.api_key}", rl[0], rl[1])
                 if not ok:
                     rate_limited = True
                     continue
             attempted = True
             try:
                 result = await fn(cand)
-                circuits[cand.provider_name].record_success()
+                if circuit is not None:
+                    circuit.record_success()
                 return result
             except UpstreamError as exc:
                 last = exc
-                if is_retryable(exc.status):
-                    circuits[cand.provider_name].record_failure()
+                if is_retryable(exc.status) and circuit is not None:
+                    circuit.record_failure()
                 if not is_retryable(exc.status):
                     break
 
@@ -369,7 +292,7 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
         raise HTTPException(status_code=502, detail=detail)
 
     async def _handle_chat(body: ChatRequest):
-        cands = router.candidates(body.model)
+        cands = state.router.candidates(body.model)
         if not cands:
             raise HTTPException(status_code=404, detail=f"unknown model: {body.model}")
         payload = body.model_dump(exclude_none=True)
@@ -386,7 +309,7 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
         return await _try_all(cands, body.model, fn)
 
     async def _handle_embeddings(body: EmbeddingsRequest):
-        cands = router.candidates(body.model)
+        cands = state.router.candidates(body.model)
         if not cands:
             raise HTTPException(status_code=404, detail=f"unknown embedding model: {body.model}")
         payload = body.model_dump(exclude_none=True)
@@ -398,6 +321,7 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
 
         return await _try_all(cands, body.model, fn)
 
+    # ---------- 基础路由 ----------
     @app.get("/", response_class=HTMLResponse)
     async def index():
         return HTMLResponse(ADMIN_HTML)
@@ -411,16 +335,16 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
         return {
             "status": "ok",
             "version": __version__,
-            "providers": len(providers),
-            "models": len(models),
+            "providers": len(state.providers),
+            "models": len(state.models),
         }
 
     @app.get("/metrics")
     async def metrics():
         gauges = [("polygate_up", {}, 1.0)]
-        for name, c in circuits.items():
-            state = 0 if c.state == "closed" else (1 if c.state == "open" else 2)
-            gauges.append(("polygate_provider_circuit_state", {"provider": name}, state))
+        for name, c in state.circuits.items():
+            s = 0 if c.state == "closed" else (1 if c.state == "open" else 2)
+            gauges.append(("polygate_provider_circuit_state", {"provider": name}, s))
         return Response(
             content=_metrics.render(extra_gauges=gauges),
             media_type="text/plain; version=0.0.4; charset=utf-8",
@@ -430,20 +354,75 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
     async def list_models(request: Request):
         _check_auth(request)
         data = [
-            {"id": name, "object": "model", "owned_by": routes[0].provider, "kind": model_kinds.get(name, "chat")}
-            for name, routes in models.items()
+            {"id": name, "object": "model", "owned_by": routes[0].provider, "kind": state.model_kinds.get(name, "chat")}
+            for name, routes in state.models.items()
         ]
         return {"object": "list", "data": data}
 
+    # ---------- 配置读写（管理面板用，热重载） ----------
+    @app.get("/v1/config")
+    async def get_config(request: Request):
+        _check_admin(request)
+        view = state.editable()
+        view["config_path"] = config_path or "(内存配置)"
+        return view
+
+    @app.put("/v1/config")
+    async def put_config(payload: dict, request: Request):
+        _check_admin(request)
+        updates = payload.get("providers") or {}
+        if not isinstance(updates, dict):
+            raise HTTPException(status_code=400, detail="providers must be an object")
+        cfg = state.cfg
+        cfg_providers = cfg.setdefault("providers", {})
+        changed = []
+        for name, patch in updates.items():
+            if not isinstance(patch, dict):
+                continue
+            prov = cfg_providers.setdefault(name, {})
+            if patch.get("base_url"):
+                prov["base_url"] = str(patch["base_url"]).strip()
+            if patch.get("api_key"):
+                prov["api_key"] = str(patch["api_key"]).strip()
+            if patch.get("timeout"):
+                try:
+                    prov["timeout"] = float(patch["timeout"])
+                except (TypeError, ValueError):
+                    pass
+            changed.append(name)
+
+        # 可选：新增模型映射
+        model_patch = payload.get("models") or []
+        if isinstance(model_patch, list):
+            cfg_models = cfg.setdefault("models", [])
+            existing = {m.get("name") for m in cfg_models if isinstance(m, dict)}
+            for m in model_patch:
+                if isinstance(m, dict) and m.get("name") and m["name"] not in existing:
+                    cfg_models.append(m)
+
+        if config_path:
+            save_config(config_path, cfg)
+        state.reload(cfg)
+        return {"ok": True, "changed": changed, "providers": list(state.providers.keys())}
+
+    @app.post("/v1/config/reload")
+    async def reload_config(request: Request):
+        _check_admin(request)
+        if not config_path:
+            raise HTTPException(status_code=400, detail="内存配置无法从文件重载")
+        state.reload(load_config(config_path))
+        return {"ok": True, "providers": list(state.providers.keys())}
+
+    # ---------- 状态与统计 ----------
     @app.get("/v1/status")
     async def status(request: Request):
         _check_admin(request)
         prov_status = {}
-        for name, c in circuits.items():
+        for name, c in state.circuits.items():
             prov_status[name] = {
                 **c.snapshot(),
-                "keys": len(providers[name].api_keys),
-                "rate_limit": rate_limits.get(name),
+                "keys": len(state.providers[name].api_keys),
+                "rate_limit": state.rate_limits.get(name),
             }
         return {
             "version": __version__,
@@ -451,12 +430,12 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
             "models": [
                 {
                     "id": name,
-                    "kind": model_kinds.get(name, "chat"),
+                    "kind": state.model_kinds.get(name, "chat"),
                     "routes": [
                         {"provider": r.provider, "model": r.model, "weight": r.weight} for r in routes
                     ],
                 }
-                for name, routes in models.items()
+                for name, routes in state.models.items()
             ],
         }
 
@@ -510,6 +489,7 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
             return await _handle_embeddings(EmbeddingsRequest(**req))
         raise HTTPException(status_code=400, detail=f"cannot replay endpoint: {endpoint}")
 
+    # ---------- 推理接口 ----------
     @app.post("/v1/chat/completions")
     async def chat_completions(body: ChatRequest, request: Request):
         _check_auth(request)
@@ -550,7 +530,7 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
         content_type = getattr(file, "content_type", None) or "application/octet-stream"
         extra = {k: v for k, v in form.items() if k not in ("model", "file")}
 
-        cands = router.candidates(model)
+        cands = state.router.candidates(model)
         if not cands:
             raise HTTPException(status_code=404, detail=f"unknown model: {model}")
 

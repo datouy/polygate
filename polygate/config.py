@@ -25,3 +25,12 @@ def _expand_env(value: Any) -> Any:
 def load_config(path: str | Path) -> dict:
     raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
     return _expand_env(raw)
+
+
+def save_config(path: str | Path, cfg: dict) -> None:
+    """把配置写回 YAML（管理面板保存时调用）。
+
+    注意：写入的是「已展开」的配置，即 ${ENV} 会被替换为实际值。
+    """
+    text = yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False, default_flow_style=False)
+    Path(path).write_text(text, encoding="utf-8")
