@@ -1,0 +1,64 @@
+# polygate 配置示例
+# 复制为 config.yaml 后填写你自己的 Key（config.yaml 已被 .gitignore 忽略，不会泄露）
+# 环境变量用 ${NAME} 引用，例如 ${DEEPSEEK_API_KEY}
+
+auth:
+  # 保护你的网关入口。设置后，客户端必须带请求头 Authorization: Bearer <api_key>
+  api_key: "change-me"
+  # /v1/usage 管理端口独立密钥（留空则复用 api_key）
+  admin_key: ""
+
+providers:
+  deepseek:
+    base_url: https://api.deepseek.com
+    api_key: ${DEEPSEEK_API_KEY}
+    # 多 Key 自动轮询（可选，会与 api_key 合并轮换）
+    api_keys: []
+    timeout: 120
+
+  qwen:
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    api_key: ${DASHSCOPE_API_KEY}
+
+  zhipu:
+    base_url: https://open.bigmodel.cn/api/paas/v4
+    api_key: ${ZHIPU_API_KEY}
+
+  moonshot:
+    base_url: https://api.moonshot.cn/v1
+    api_key: ${MOONSHOT_API_KEY}
+
+  openai:
+    base_url: https://api.openai.com/v1
+    api_key: ${OPENAI_API_KEY}
+
+models:
+  - name: deepseek-chat
+    providers:
+      - { provider: deepseek, model: deepseek-chat, weight: 1 }
+
+  - name: deepseek-reasoner
+    providers:
+      - { provider: deepseek, model: deepseek-reasoner }
+
+  - name: qwen-plus
+    providers:
+      - { provider: qwen, model: qwen-plus }
+
+  - name: glm-4-flash
+    providers:
+      - { provider: zhipu, model: glm-4-flash }
+
+  - name: moonshot-v1-8k
+    providers:
+      - { provider: moonshot, model: moonshot-v1-8k }
+
+  - name: gpt-4o-mini
+    providers:
+      - { provider: openai, model: gpt-4o-mini }
+
+  # 多 Provider 故障切换示例：优先 deepseek（权重 3），失败自动切 qwen（权重 1）
+  - name: chat-fallback
+    providers:
+      - { provider: deepseek, model: deepseek-chat, weight: 3 }
+      - { provider: qwen, model: qwen-plus, weight: 1 }
