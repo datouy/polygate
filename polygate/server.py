@@ -21,7 +21,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from . import __version__
 from .admin import ADMIN_HTML
-from .config import load_config, save_config
+from .config import load_config
+from .configstore import ConfigStore, merge_config
 from .cost import CostTracker, compute_cost
 from .errors import UpstreamError, is_retryable
 from .metrics import Metrics
@@ -56,14 +57,15 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
     global _client, _store, _reqlog, _cost
 
     if isinstance(config, dict):
-        cfg = config
+        base_cfg = config
         config_path: Optional[str] = None
     else:
         config_path = _resolve_config_path(config)
-        cfg = load_config(config_path)
+        base_cfg = load_config(config_path)
 
-    state = RuntimeState(cfg)
-    db_path = cfg.get("db_path", "polygate.db") or None
+    db_path = base_cfg.get("db_path", "polygate.db") or None
+    config_store = ConfigStore(db_path)
+    state = RuntimeState(merge_config(base_cfg, config_store.load()))
 
     # ---------- 记录与日志 ----------
     def _record_stats(model, provider, status, prompt=0, completion=0, latency_ms=0.0, key_label=None):
@@ -142,6 +144,7 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
                 if obj is not None:
                     obj.close()
             _store = _reqlog = _cost = None
+            config_store.close()
 
     app = FastAPI(
         title="polygate",
@@ -359,12 +362,14 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
         ]
         return {"object": "list", "data": data}
 
-    # ---------- 配置读写（管理面板用，热重载） ----------
+    # ---------- 配置读写（存 SQLite，绝不写回 yaml；热重载） ----------
     @app.get("/v1/config")
     async def get_config(request: Request):
         _check_admin(request)
         view = state.editable()
         view["config_path"] = config_path or "(内存配置)"
+        view["storage"] = "sqlite" if db_path else "memory"
+        view["yaml_writable"] = False
         return view
 
     @app.put("/v1/config")
@@ -373,13 +378,14 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
         updates = payload.get("providers") or {}
         if not isinstance(updates, dict):
             raise HTTPException(status_code=400, detail="providers must be an object")
-        cfg = state.cfg
-        cfg_providers = cfg.setdefault("providers", {})
+
+        overrides = config_store.load()
+        ov_providers = overrides.setdefault("providers", {})
         changed = []
         for name, patch in updates.items():
             if not isinstance(patch, dict):
                 continue
-            prov = cfg_providers.setdefault(name, {})
+            prov = ov_providers.setdefault(name, {})
             if patch.get("base_url"):
                 prov["base_url"] = str(patch["base_url"]).strip()
             if patch.get("api_key"):
@@ -391,26 +397,41 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
                     pass
             changed.append(name)
 
-        # 可选：新增模型映射
+        # 可选：新增/更新模型映射
         model_patch = payload.get("models") or []
         if isinstance(model_patch, list):
-            cfg_models = cfg.setdefault("models", [])
-            existing = {m.get("name") for m in cfg_models if isinstance(m, dict)}
+            ov_models = overrides.setdefault("models", [])
             for m in model_patch:
-                if isinstance(m, dict) and m.get("name") and m["name"] not in existing:
-                    cfg_models.append(m)
+                if not isinstance(m, dict) or not m.get("name"):
+                    continue
+                found = next(
+                    (x for x in ov_models if isinstance(x, dict) and x.get("name") == m["name"]),
+                    None,
+                )
+                if found is not None:
+                    found.update(m)
+                else:
+                    ov_models.append(m)
 
-        if config_path:
-            save_config(config_path, cfg)
-        state.reload(cfg)
+        config_store.save(overrides)
+        state.reload(merge_config(base_cfg, overrides))
         return {"ok": True, "changed": changed, "providers": list(state.providers.keys())}
+
+    @app.delete("/v1/config")
+    async def reset_config(request: Request):
+        """清除所有 SQLite 覆盖，回到 config.yaml 的原始配置。"""
+        _check_admin(request)
+        config_store.save({})
+        state.reload(merge_config(base_cfg, {}))
+        return {"ok": True, "providers": list(state.providers.keys())}
 
     @app.post("/v1/config/reload")
     async def reload_config(request: Request):
+        nonlocal base_cfg
         _check_admin(request)
-        if not config_path:
-            raise HTTPException(status_code=400, detail="内存配置无法从文件重载")
-        state.reload(load_config(config_path))
+        if config_path:
+            base_cfg = load_config(config_path)
+        state.reload(merge_config(base_cfg, config_store.load()))
         return {"ok": True, "providers": list(state.providers.keys())}
 
     # ---------- 状态与统计 ----------

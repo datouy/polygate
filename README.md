@@ -52,7 +52,7 @@
 | 按 Key 成本记账 · Cost accounting | 结合各家 token 单价，按 Key/模型汇总成本 |
 | Prometheus 指标 · Metrics | `/metrics` 导出调用、错误、token、延迟、熔断状态 |
 | Web 管理面板 · Admin panel | `/admin` 实时查看 Provider、模型、用量、成本、最近请求 |
-| 在线改配置 · Live config | 面板内直接改 Provider 的 base_url / API Key，保存即热重载，无需重启 |
+| 在线改配置 · Live config | 面板内直接改 Provider 的 base_url / API Key，存 SQLite（**不改 config.yaml**），保存即热重载 |
 | 网关鉴权 · Gateway auth | 用你自己的 Key 保护入口，不暴露上游 Key |
 
 ---
@@ -132,6 +132,9 @@ models:
       - { provider: openai, model: whisper-1 }
 ```
 
+> 📝 **配置优先级**：`config.yaml`（模板，只读）→ 叠加 SQLite 覆盖（`polygate.db`，管理面板写入）。<br>
+> 面板里改的 URL / Key **只进 SQLite，不写回 config.yaml**；想恢复 yaml 原值，点面板「重置为 yaml 配置」或调 `DELETE /v1/config`。
+
 ### 各 Provider 官方 OpenAI 兼容地址 · Provider base URLs
 
 | 厂商 Provider | base_url |
@@ -159,8 +162,9 @@ models:
 | POST | `/v1/audio/transcriptions` | 语音转写 · transcription |
 | GET | `/v1/status` | Provider 熔断/限流状态 · circuit/rate state（admin） |
 | GET | `/v1/config` | 读取可编辑配置，Key 脱敏 · editable config, keys masked（admin） |
-| PUT | `/v1/config` | 改 base_url / api_key，保存即热重载 · update & hot-reload（admin） |
-| POST | `/v1/config/reload` | 从配置文件重载 · reload from file（admin） |
+| PUT | `/v1/config` | 改 base_url / api_key → 存 SQLite + 热重载 · update & hot-reload（admin） |
+| DELETE | `/v1/config` | 清除 SQLite 覆盖，回到 config.yaml · reset to yaml（admin） |
+| POST | `/v1/config/reload` | 重新读 config.yaml 再叠加覆盖 · reload from file（admin） |
 | GET | `/v1/usage` | 实时用量 · live usage（admin） |
 | GET | `/v1/usage/history?days=7` | 每日用量历史 · daily history（admin） |
 | GET | `/v1/costs` | 按 Key/模型成本 · cost summary（admin） |
@@ -207,7 +211,8 @@ polygate/
 ├── polygate/
 │   ├── server.py          # FastAPI 应用与路由 · app & routes
 │   ├── runtime.py         # 运行时状态 + 热重载 · runtime state & hot reload
-│   ├── config.py          # 配置加载/保存 + 环境变量展开 · config load/save
+│   ├── configstore.py     # 配置覆盖存 SQLite（不改 yaml）· config overrides
+│   ├── config.py          # 配置加载 + 环境变量展开 · config loader
 │   ├── providers.py       # Provider 抽象 · provider abstraction
 │   ├── router.py          # 权重路由 / 多 Key 轮询 / 故障切换候选 · routing
 │   ├── stats.py           # 内存用量统计 · in-memory stats

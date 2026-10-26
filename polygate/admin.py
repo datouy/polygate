@@ -47,10 +47,11 @@ th{color:var(--muted);font-weight:500}
   <section class="card"><h2>成本</h2><div id="cost-total" class="muted"></div><table id="costs"><thead><tr><th>Key</th><th>成本</th><th>调用</th><th>Tokens</th></tr></thead><tbody></tbody></table></section>
   <section class="card"><h2>最近请求</h2><table id="requests"><thead><tr><th>端点</th><th>模型</th><th>Provider</th><th>状态</th><th>延迟</th></tr></thead><tbody></tbody></table></section>
   <section class="card" style="grid-column:1/-1">
-    <h2>⚙️ 配置 · 在线修改（保存后热重载，无需重启）</h2>
+    <h2>⚙️ 配置 · 在线修改（存 SQLite，不改 config.yaml；保存即热重载）</h2>
     <table id="cfg-providers"><thead><tr><th style="width:130px">Provider</th><th>Base URL</th><th>API Key（留空 = 不改）</th><th style="width:45px">Key</th></tr></thead><tbody></tbody></table>
     <div class="toolbar" style="margin-top:12px">
       <button onclick="saveConfig()">保存全部</button>
+      <button onclick="resetConfig()" style="background:#30363d;color:var(--fg)">重置为 yaml 配置</button>
       <span id="cfg-msg" class="muted"></span>
     </div>
     <hr style="border:0;border-top:1px solid var(--border);margin:16px 0">
@@ -71,7 +72,7 @@ th{color:var(--muted);font-weight:500}
       <input id="new-model" placeholder="可选：模型名" style="width:130px">
       <button onclick="addProvider()">添加</button>
     </div>
-    <p class="muted" style="margin:8px 0 0">提示：填了「模型名」会自动创建一条 chat 模型映射，添加后即可直接调用。</p>
+    <p class="muted" style="margin:8px 0 0">配置保存在 SQLite（polygate.db），<b>不会修改 config.yaml</b>；填了「模型名」会自动创建一条 chat 模型映射。</p>
   </section>
 </main>
 <script>
@@ -161,6 +162,15 @@ function fillPreset(){
   const urlEl=document.getElementById('new-url');
   if(v==='custom'){urlEl.value='';return;}
   if(PRESETS[v]){urlEl.value=PRESETS[v];}
+}
+async function resetConfig(){
+  const msg=document.getElementById('cfg-msg');
+  try{
+    const r=await fetch('/v1/config',{method:'DELETE',headers:H()});
+    if(!r.ok){throw new Error(await r.text());}
+    msg.textContent='已重置为 config.yaml 配置 ✓';msg.style.color='var(--green)';
+    await loadConfig();refresh();
+  }catch(e){msg.textContent='重置失败: '+e.message;msg.style.color='var(--red)';}
 }
 async function addProvider(){
   const name=document.getElementById('new-name').value.trim();
