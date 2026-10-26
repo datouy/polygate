@@ -103,13 +103,25 @@ def _build_limiter(redis_cfg):
         return RateLimiter()
 
 
+def _resolve_config_path(config):
+    """解析配置来源：显式参数 > 环境变量 > config.yaml > config.example.yaml。"""
+    if config:
+        return config
+    env = os.environ.get("POLYGATE_CONFIG")
+    if env:
+        return env
+    if os.path.exists("config.yaml"):
+        return "config.yaml"
+    return "config.example.yaml"
+
+
 def create_app(config: Optional[str | dict] = None) -> FastAPI:
     global _client, _store, _reqlog, _cost
 
     if isinstance(config, dict):
         cfg = config
     else:
-        path = config or os.environ.get("POLYGATE_CONFIG", "config.example.yaml")
+        path = _resolve_config_path(config)
         cfg = load_config(path)
 
     providers, models, model_kinds, rate_limits, pricing = _build(cfg)
