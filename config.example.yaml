@@ -18,6 +18,21 @@ health:
   failure_threshold: 3  # 连续失败 N 次后熔断
   cooldown: 60          # 熔断后冷却多久进入半开探测（秒）
 
+# Redis 分布式限流（可选）：配置后限流状态在多个网关进程间共享
+# 不配置则使用进程内存限流
+# redis:
+#   url: redis://127.0.0.1:6379/0
+
+# 成本记账定价（单位：每百万 token 的价格，按你的币种统一即可）
+# key 为配置里的模型名，"*" 为兜底默认价
+pricing:
+  deepseek-chat: { input: 2, output: 8 }
+  deepseek-reasoner: { input: 4, output: 16 }
+  qwen-plus: { input: 0.8, output: 2 }
+  glm-4-flash: { input: 0, output: 0 }
+  moonshot-v1-8k: { input: 12, output: 12 }
+  "*": { input: 0, output: 0 }
+
 providers:
   deepseek:
     base_url: https://api.deepseek.com
@@ -85,3 +100,14 @@ models:
     kind: embeddings
     providers:
       - { provider: zhipu, model: embedding-3 }
+
+  # 语音转写模型（kind: audio，走 /v1/audio/transcriptions 统一转发）
+  - name: whisper-1
+    kind: audio
+    providers:
+      - { provider: openai, model: whisper-1 }
+
+  - name: qwen-audio-asr
+    kind: audio
+    providers:
+      - { provider: qwen, model: qwen-audio-asr }

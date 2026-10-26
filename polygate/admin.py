@@ -44,6 +44,8 @@ th{color:var(--muted);font-weight:500}
   <section class="card"><h2>Models</h2><table id="models"><thead><tr><th>模型</th><th>类型</th><th>路由</th></tr></thead><tbody></tbody></table></section>
   <section class="card"><h2>实时用量</h2><table id="usage"><thead><tr><th>模型</th><th>调用</th><th>错误</th><th>Tokens</th><th>平均延迟</th></tr></thead><tbody></tbody></table></section>
   <section class="card"><h2>每日历史</h2><table id="history"><thead><tr><th>日期</th><th>调用</th><th>错误</th><th>Tokens</th></tr></thead><tbody></tbody></table></section>
+  <section class="card"><h2>成本</h2><div id="cost-total" class="muted"></div><table id="costs"><thead><tr><th>Key</th><th>成本</th><th>调用</th><th>Tokens</th></tr></thead><tbody></tbody></table></section>
+  <section class="card"><h2>最近请求</h2><table id="requests"><thead><tr><th>端点</th><th>模型</th><th>Provider</th><th>状态</th><th>延迟</th></tr></thead><tbody></tbody></table></section>
 </main>
 <script>
 function k(){return localStorage.getItem('polygate_key')||'change-me';}
@@ -77,6 +79,19 @@ async function refresh(){
     const ht=document.querySelector('#history tbody');ht.innerHTML='';
     for(const h of hist){
       ht.insertAdjacentHTML('beforeend','<tr><td>'+h.day+'</td><td>'+h.calls+'</td><td>'+h.errors+'</td><td>'+(h.prompt_tokens+h.completion_tokens)+'</td></tr>');
+    }
+    let costs=[];
+    try{costs=await getJSON('/v1/costs');}catch(e){}
+    document.getElementById('cost-total').textContent='总成本: '+costs.total;
+    const cst=document.querySelector('#costs tbody');cst.innerHTML='';
+    for(const c of (costs.by_key||[])){
+      cst.insertAdjacentHTML('beforeend','<tr><td>'+c.key+'</td><td>'+c.cost+'</td><td>'+c.calls+'</td><td>'+(c.prompt_tokens+c.completion_tokens)+'</td></tr>');
+    }
+    let reqs=[];
+    try{reqs=await getJSON('/v1/requests?limit=10');}catch(e){}
+    const rt=document.querySelector('#requests tbody');rt.innerHTML='';
+    for(const r of reqs){
+      rt.insertAdjacentHTML('beforeend','<tr><td>'+r.endpoint+'</td><td>'+r.model+'</td><td>'+(r.provider||'')+'</td><td>'+r.status+'</td><td>'+r.latency_ms+'ms</td></tr>');
     }
     st.textContent='已连接 '+new Date().toLocaleTimeString();
     st.className='ok';

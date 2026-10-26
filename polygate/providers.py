@@ -27,6 +27,13 @@ class Provider:
         return f"{base}/embeddings"
 
     @property
+    def transcriptions_url(self) -> str:
+        base = self.base_url.rstrip("/")
+        if base.endswith("/audio/transcriptions"):
+            return base
+        return f"{base}/audio/transcriptions"
+
+    @property
     def models_url(self) -> str:
         return f"{self.base_url.rstrip('/')}/models"
 

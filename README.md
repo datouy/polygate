@@ -2,7 +2,8 @@
 
 > 一把钥匙，接入 DeepSeek / 通义千问 / 智谱 GLM / Kimi / OpenAI。
 > 纯 Python + FastAPI，OpenAI 兼容，支持多 Key 轮询、权重负载均衡、故障自动切换、流式透传、
-> 令牌桶限流、熔断器、SQLite 用量持久化、Embeddings 转发与内置管理面板。
+> 令牌桶限流（内存/Redis）、熔断器、SQLite 用量持久化、请求日志与重放、按 Key 成本记账、
+> Embeddings / 语音转写转发、Prometheus 指标与内置管理面板。
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
@@ -32,7 +33,12 @@
 | SQLite 持久化 | 每次调用落库，支持按日汇总查询 |
 | 令牌桶限流 | 按 Provider + Key 维度限流（rate/burst） |
 | 熔断器 | 连续失败自动熔断，冷却后半开放行单个探测，自动恢复 |
-| Web 管理面板 | `/admin` 实时查看 Provider 状态、模型、用量、每日历史 |
+| 请求日志与重放 | 每次调用落库，支持列表/详情/一键重放 |
+| 按 Key 成本记账 | 结合各家 token 单价，按 Key/模型统计成本 |
+| Prometheus 指标 | `/metrics` 导出调用、错误、token、延迟、熔断状态 |
+| 语音转写转发 | `/v1/audio/transcriptions` 统一转发（multipart） |
+| Redis 分布式限流 | 多进程共享限流状态（可选，未配置则内存限流） |
+| Web 管理面板 | `/admin` 实时查看 Provider、模型、用量、成本、最近请求 |
 | 网关鉴权 | 用你自己的 Key 保护入口，不暴露上游 Key |
 
 ---
@@ -123,9 +129,15 @@ models:
 | POST | `/v1/chat/completions` | 对话（支持 `stream: true`） |
 | POST | `/v1/completions` | 旧版补全（自动转 chat） |
 | POST | `/v1/embeddings` | 向量化（统一转发） |
+| POST | `/v1/audio/transcriptions` | 语音转写（统一转发） |
 | GET | `/v1/status` | Provider 熔断/限流状态（需 admin key） |
 | GET | `/v1/usage` | 实时用量统计（需 admin key） |
 | GET | `/v1/usage/history?days=7` | 每日用量历史（需 admin key） |
+| GET | `/v1/costs` | 按 Key/模型成本汇总（需 admin key） |
+| GET | `/v1/requests?limit=50` | 请求日志列表（需 admin key） |
+| GET | `/v1/requests/{req_id}` | 请求详情（需 admin key） |
+| POST | `/v1/requests/{req_id}/replay` | 重放请求（需 admin key） |
+| GET | `/metrics` | Prometheus 指标 |
 | GET | `/admin` | Web 管理面板 |
 
 ### 用 openai 官方 SDK 调用
@@ -169,7 +181,11 @@ polygate/
 │   ├── router.py          # 权重路由 / 多 Key 轮询 / 故障切换候选
 │   ├── stats.py           # 内存用量统计
 │   ├── store.py           # SQLite 用量持久化
-│   ├── ratelimit.py       # 令牌桶限流
+│   ├── requestlog.py      # 请求日志与重放（SQLite）
+│   ├── cost.py            # 按 Key/模型成本记账（SQLite）
+│   ├── metrics.py         # Prometheus 指标（无依赖）
+│   ├── ratelimit.py       # 内存令牌桶限流
+│   ├── redislimiter.py    # Redis 分布式限流（Lua 令牌桶）
 │   ├── circuit.py         # 熔断器（closed/open/half_open）
 │   ├── admin.py           # Web 管理面板（单文件 HTML）
 │   ├── schemas.py         # 请求模型
@@ -179,9 +195,13 @@ polygate/
 │   └── curl.sh            # curl 示例
 └── tests/
     ├── test_core.py       # 核心逻辑单测
-    ├── test_ratelimit.py  # 限流单测
+    ├── test_ratelimit.py  # 内存限流单测
+    ├── test_redislimiter.py # Redis 限流单测（自动跳过）
     ├── test_circuit.py    # 熔断单测
     ├── test_store.py      # 持久化单测
+    ├── test_metrics.py    # 指标单测
+    ├── test_cost.py       # 成本单测
+    ├── test_requestlog.py # 请求日志单测
     └── test_e2e.py        # 端到端测试（Mock 上游）
 ```
 
@@ -194,8 +214,9 @@ pip install pytest
 python -m pytest -q
 ```
 
-测试覆盖：配置环境变量展开、路由权重/故障切换候选、无 Key Provider 跳过、重试策略、令牌桶限流、
-熔断器三态迁移、SQLite 持久化与按日汇总，以及本地 Mock 上游下的完整非流式 + 流式 + Embeddings 端到端流程。
+测试覆盖：配置环境变量展开、路由权重/故障切换候选、无 Key Provider 跳过、重试策略、内存/Redis 限流、
+熔断器三态迁移、SQLite 持久化与按日汇总、Prometheus 指标、成本记账、请求日志与重放，
+以及本地 Mock 上游下的完整非流式 + 流式 + Embeddings + 语音转写端到端流程。
 
 ---
 
@@ -206,11 +227,11 @@ python -m pytest -q
 - [x] 上游健康检查与自动熔断（circuit breaker）
 - [x] 支持 `/v1/embeddings` 统一转发
 - [x] 简单的 Web 管理面板
-- [ ] 请求日志与重放
-- [ ] 按 Key 记账与成本估算（结合各家 token 单价）
-- [ ] 上游健康检查与自动熔断的 Prometheus 指标导出
-- [ ] `/v1/audio/transcriptions` 语音转写转发
-- [ ] 多进程/分布式限流（Redis 后端）
+- [x] 请求日志与重放
+- [x] 按 Key 记账与成本估算（结合各家 token 单价）
+- [x] Prometheus 指标导出
+- [x] `/v1/audio/transcriptions` 语音转写转发
+- [x] 多进程/分布式限流（Redis 后端）
 
 ---
 
