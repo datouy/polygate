@@ -5,6 +5,10 @@
 # SQLite 用量持久化（留空或删除则禁用持久化）
 db_path: polygate.db
 
+# 流式请求自动注入 stream_options.include_usage（用于统计流式 token/成本）。
+# 部分国产厂商（DashScope/GLM 等）可能不兼容该字段；关闭后流式 token 将记为 0。
+stream_include_usage: true
+
 auth:
   # 保护你的网关入口。设置后，客户端必须带请求头 Authorization: Bearer <api_key>
   api_key: "change-me"

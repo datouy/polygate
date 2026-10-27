@@ -45,6 +45,23 @@ class CircuitBreaker:
                 self.state = "open"
                 self.opened_at = time.monotonic()
 
+    def record_probe(self, success: bool) -> None:
+        """记录主动健康探测的结果。
+
+        与业务流量（record_success/record_failure）分开：探测只用于 half_open
+        状态下的恢复判定，绝不重置 closed 状态下的业务失败计数，也不在 closed
+        状态下因探测失败而直接熔断（熔断应由真实请求流量驱动）。
+        """
+        with self._lock:
+            if self.state != "half_open":
+                return
+            if success:
+                self.consecutive_failures = 0
+                self.state = "closed"
+            else:
+                self.state = "open"
+                self.opened_at = time.monotonic()
+
     def snapshot(self) -> dict:
         with self._lock:
             return {"state": self.state, "consecutive_failures": self.consecutive_failures}

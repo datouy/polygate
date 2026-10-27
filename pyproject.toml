@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "polygate"
+description = "国产大模型统一 API 网关（OpenAI 兼容）"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "datouy" }]
+keywords = ["llm", "gateway", "openai", "deepseek", "qwen", "glm", "kimi"]
+dynamic = ["version"]
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "httpx>=0.27",
+    "pyyaml>=6.0",
+    "pydantic>=2.6",
+]
+
+[project.optional-dependencies]
+redis = ["redis>=5.0"]
+dev = ["pytest>=8.0", "ruff>=0.5", "mypy>=1.10"]
+
+[project.urls]
+Homepage = "https://github.com/datouy/polygate"
+Repository = "https://github.com/datouy/polygate"
+Issues = "https://github.com/datouy/polygate/issues"
+
+[tool.setuptools]
+packages = ["polygate"]
+
+[tool.setuptools.dynamic]
+version = { attr = "polygate.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+ignore = ["E501", "B008"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+warn_unused_ignores = false

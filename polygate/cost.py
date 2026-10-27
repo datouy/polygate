@@ -6,6 +6,8 @@ import sqlite3
 import threading
 import time
 
+from .db import BatchWriter
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS costs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -31,32 +33,52 @@ def compute_cost(prompt_tokens: int, completion_tokens: int, pricing: dict, mode
 
 
 class CostTracker:
-    def __init__(self, db_path: str):
-        self._lock = threading.Lock()
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.executescript(_SCHEMA)
-        self._conn.commit()
+    def __init__(self, db_path: str, writer: BatchWriter | None = None):
+        self._writer = writer
+        if writer is not None:
+            self._conn = writer.conn
+            self._lock = writer.lock
+            writer.executescript(_SCHEMA)
+        else:
+            self._lock = threading.Lock()
+            self._conn = sqlite3.connect(db_path, check_same_thread=False)
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA busy_timeout=5000")
+            self._conn.executescript(_SCHEMA)
+            self._conn.commit()
 
     def add(self, key_label: str, model: str, prompt: int, completion: int, cost: float) -> None:
+        sql = (
+            "INSERT INTO costs(ts,key_label,model,prompt_tokens,completion_tokens,cost) "
+            "VALUES(?,?,?,?,?,?)"
+        )
+        params = (time.time(), key_label, model, int(prompt), int(completion), float(cost))
+        if self._writer is not None:
+            self._writer.enqueue(sql, params)
+            return
         with self._lock:
-            self._conn.execute(
-                "INSERT INTO costs(ts,key_label,model,prompt_tokens,completion_tokens,cost) VALUES(?,?,?,?,?,?)",
-                (time.time(), key_label, model, int(prompt), int(completion), float(cost)),
-            )
+            self._conn.execute(sql, params)
             self._conn.commit()
 
     def summary(self) -> dict:
-        with self._lock:
-            by_key = self._conn.execute(
-                "SELECT key_label, SUM(cost), SUM(prompt_tokens), SUM(completion_tokens), COUNT(*) "
-                "FROM costs GROUP BY key_label ORDER BY SUM(cost) DESC"
-            ).fetchall()
-            by_model = self._conn.execute(
-                "SELECT model, SUM(cost), SUM(prompt_tokens), SUM(completion_tokens), COUNT(*) "
-                "FROM costs GROUP BY model ORDER BY SUM(cost) DESC"
-            ).fetchall()
-            total = self._conn.execute("SELECT COALESCE(SUM(cost),0) FROM costs").fetchone()[0]
+        by_key_sql = (
+            "SELECT key_label, SUM(cost), SUM(prompt_tokens), SUM(completion_tokens), COUNT(*) "
+            "FROM costs GROUP BY key_label ORDER BY SUM(cost) DESC"
+        )
+        by_model_sql = (
+            "SELECT model, SUM(cost), SUM(prompt_tokens), SUM(completion_tokens), COUNT(*) "
+            "FROM costs GROUP BY model ORDER BY SUM(cost) DESC"
+        )
+        total_sql = "SELECT COALESCE(SUM(cost),0) FROM costs"
+        if self._writer is not None:
+            by_key = self._writer.query(by_key_sql)
+            by_model = self._writer.query(by_model_sql)
+            total = self._writer.query_one(total_sql)[0]
+        else:
+            with self._lock:
+                by_key = self._conn.execute(by_key_sql).fetchall()
+                by_model = self._conn.execute(by_model_sql).fetchall()
+                total = self._conn.execute(total_sql).fetchone()[0]
         return {
             "total": round(total, 6),
             "by_key": [
@@ -82,5 +104,6 @@ class CostTracker:
         }
 
     def close(self) -> None:
-        with self._lock:
-            self._conn.close()
+        if self._writer is None:
+            with self._lock:
+                self._conn.close()

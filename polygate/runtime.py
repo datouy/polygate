@@ -72,9 +72,12 @@ def mask_key(key: str) -> str:
 
 
 class RuntimeState:
-    """网关运行时状态。reload() 会就地重建，所有处理函数实时读到新值。"""
+    """网关运行时状态。reload() 会就地更新，所有处理函数实时读到新值。"""
 
     def __init__(self, cfg: dict):
+        self.circuits: dict[str, CircuitBreaker] = {}
+        self.limiter = None
+        self._redis_cfg_signature: object = object()
         self.reload(cfg)
 
     def reload(self, cfg: dict) -> None:
@@ -86,18 +89,35 @@ class RuntimeState:
         health_cfg = cfg.get("health") or {}
         self.health_enabled = bool(health_cfg.get("enabled", True))
         self.health_interval = float(health_cfg.get("interval", 30.0))
-        self.circuits: dict[str, CircuitBreaker] = {
-            name: CircuitBreaker(
-                failure_threshold=int(health_cfg.get("failure_threshold", 3)),
-                cooldown_sec=float(health_cfg.get("cooldown", 60.0)),
-            )
-            for name in self.providers
-        }
+        threshold = int(health_cfg.get("failure_threshold", 3))
+        cooldown = float(health_cfg.get("cooldown", 60.0))
+
+        # 保留已有熔断器实例，仅更新参数；新增 Provider 才新建，移除的随之丢弃。
+        # 否则每次保存配置都会把失败计数归零，熔断器在生产中形同虚设。
+        circuits: dict[str, CircuitBreaker] = {}
+        for name in self.providers:
+            cb = self.circuits.get(name)
+            if cb is None:
+                cb = CircuitBreaker(failure_threshold=threshold, cooldown_sec=cooldown)
+            else:
+                cb.failure_threshold = threshold
+                cb.cooldown_sec = cooldown
+            circuits[name] = cb
+        self.circuits = circuits
 
         auth = cfg.get("auth") or {}
         self.gateway_key = auth.get("api_key") or None
         self.admin_key = auth.get("admin_key") or self.gateway_key
-        self.limiter = build_limiter(cfg.get("redis"))
+
+        # 仅当 Redis URL 变化时才重建限流器，避免每次热重载泄漏一个 Redis 连接池。
+        redis_cfg = cfg.get("redis")
+        sig = (redis_cfg or {}).get("url") if isinstance(redis_cfg, dict) else None
+        if self.limiter is None or sig != self._redis_cfg_signature:
+            self._redis_cfg_signature = sig
+            self.limiter = build_limiter(redis_cfg)
+
+        # stream_options.include_usage 自动注入开关（部分国产厂商不兼容，可关）。
+        self.stream_include_usage = bool(cfg.get("stream_include_usage", True))
 
     def editable(self) -> dict:
         """给管理面板用的可编辑视图（Key 已脱敏，绝不返回明文）。"""

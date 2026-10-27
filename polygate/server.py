@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 import uuid
@@ -24,7 +25,8 @@ from .admin import ADMIN_HTML
 from .config import load_config
 from .configstore import ConfigStore, merge_config
 from .cost import CostTracker, compute_cost
-from .errors import UpstreamError, is_retryable
+from .db import BatchWriter
+from .errors import UpstreamError, is_key_error, is_retryable
 from .metrics import Metrics
 from .requestlog import RequestLog
 from .router import Candidate
@@ -33,12 +35,16 @@ from .schemas import ChatRequest, EmbeddingsRequest
 from .stats import Stats
 from .store import UsageStore
 
-_client: Optional[httpx.AsyncClient] = None
-_stats = Stats()
-_metrics = Metrics()
-_store: Optional[UsageStore] = None
-_reqlog: Optional[RequestLog] = None
-_cost: Optional[CostTracker] = None
+# 透传给客户端的上游响应头（排除 x-request-id，它另存为 X-Upstream-Request-Id）
+_PASSTHROUGH_HEADERS = (
+    "retry-after",
+    "ratelimit-limit",
+    "ratelimit-remaining",
+    "ratelimit-reset",
+    "ratelimit-limit-tokens",
+    "ratelimit-remaining-tokens",
+    "ratelimit-reset-tokens",
+)
 
 
 def _resolve_config_path(config):
@@ -53,8 +59,53 @@ def _resolve_config_path(config):
     return "config.example.yaml"
 
 
+def _upstream_headers(resp: httpx.Response) -> dict:
+    """透传上游的排障/限流响应头，并把上游 x-request-id 改名避免与网关冲突。"""
+    out: dict = {}
+    if resp.headers.get("x-request-id"):
+        out["X-Upstream-Request-Id"] = resp.headers["x-request-id"]
+    for name in _PASSTHROUGH_HEADERS:
+        if name in resp.headers:
+            out[name] = resp.headers[name]
+    return out
+
+
+def _timeout_for(prov) -> httpx.Timeout:
+    """让每个 Provider 的 timeout 配置真正生效。"""
+    t = float(getattr(prov, "timeout", None) or 120.0)
+    return httpx.Timeout(t, connect=min(10.0, t))
+
+
+def _extract_stream_usage(line: bytes, usage: dict) -> dict:
+    """从一条 SSE ``data:`` 行里提取 usage（OpenAI 兼容：usage 在末尾一次性给出）。"""
+    line = line.strip()
+    if not line.startswith(b"data:"):
+        return usage
+    data = line[5:].strip()
+    if not data or data == b"[DONE]":
+        return usage
+    try:
+        obj = json.loads(data)
+    except Exception:
+        return usage
+    u = obj.get("usage") if isinstance(obj, dict) else None
+    if isinstance(u, dict):
+        for k in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            v = u.get(k)
+            if isinstance(v, (int, float)):
+                usage[k] = int(v)
+    return usage
+
+
 def create_app(config: Optional[str | dict] = None) -> FastAPI:
-    global _client, _store, _reqlog, _cost
+    # 每个 app 实例持有独立状态，避免多实例互相污染。
+    client: Optional[httpx.AsyncClient] = None
+    stats = Stats()
+    metrics = Metrics()
+    store: Optional[UsageStore] = None
+    reqlog: Optional[RequestLog] = None
+    cost: Optional[CostTracker] = None
+    writer: Optional[BatchWriter] = None
 
     if isinstance(config, dict):
         base_cfg = config
@@ -69,44 +120,46 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
 
     # ---------- 记录与日志 ----------
     def _record_stats(model, provider, status, prompt=0, completion=0, latency_ms=0.0, key_label=None):
-        _stats.record(model, provider, status, prompt, completion, latency_ms)
-        if _store is not None:
-            _store.record(model, provider, status, prompt, completion, latency_ms)
-        if _cost is not None and status == "ok" and key_label:
-            cost = compute_cost(prompt, completion, state.pricing, model)
-            if cost > 0:
-                _cost.add(key_label, model, prompt, completion, cost)
-        _metrics.inc("polygate_requests_total", {"model": model, "provider": provider, "status": status})
+        stats.record(model, provider, status, prompt, completion, latency_ms)
+        if store is not None:
+            store.record(model, provider, status, prompt, completion, latency_ms)
+        if cost is not None and status == "ok" and key_label:
+            c = compute_cost(prompt, completion, state.pricing, model)
+            if c > 0:
+                cost.add(key_label, model, prompt, completion, c)
+        metrics.inc("polygate_requests_total", {"model": model, "provider": provider, "status": status})
         if status == "error":
-            _metrics.inc("polygate_errors_total", {"model": model})
+            metrics.inc("polygate_errors_total", {"model": model})
         if prompt:
-            _metrics.inc("polygate_tokens_total", {"model": model, "type": "prompt"}, prompt)
+            metrics.inc("polygate_tokens_total", {"model": model, "type": "prompt"}, prompt)
         if completion:
-            _metrics.inc("polygate_tokens_total", {"model": model, "type": "completion"}, completion)
+            metrics.inc("polygate_tokens_total", {"model": model, "type": "completion"}, completion)
         if latency_ms:
-            _metrics.observe("polygate_request_duration_seconds", latency_ms / 1000.0, {"model": model})
+            metrics.observe("polygate_request_duration_seconds", latency_ms / 1000.0, {"model": model})
 
-    def _log_request(ctx, provider, model_name, key_label, status, status_code, latency, request, response, error):
-        if _reqlog is None:
+    def _log_request(ctx, provider, model_name, key_label, status, status_code, latency, request, response, error, upstream_model=None):
+        if reqlog is None:
             return
         try:
-            _reqlog.log(
+            reqlog.log(
                 req_id=ctx["req_id"], endpoint=ctx["endpoint"], model=model_name, provider=provider,
                 key_label=key_label, status=status, status_code=status_code, latency_ms=latency,
-                request=request, response=response, error=error,
+                request=request, response=response, error=error, upstream_model=upstream_model,
             )
         except Exception:
             pass
 
     # ---------- 健康检查 ----------
     async def _ping_provider(prov) -> bool:
-        if not prov.api_keys:
-            return False
-        try:
-            resp = await _client.get(prov.models_url, headers=prov.headers(prov.api_keys[0]), timeout=5.0)
-            return resp.status_code < 500
-        except httpx.HTTPError:
-            return False
+        """尝试所有 Key；2xx/3xx 视为健康，401/403/404/5xx 视为该 Key 不健康。"""
+        for key in prov.api_keys:
+            try:
+                resp = await client.get(prov.models_url, headers=prov.headers(key), timeout=5.0)
+                if resp.status_code < 400:
+                    return True
+            except httpx.HTTPError:
+                continue
+        return False
 
     async def _health_loop():
         while True:
@@ -117,33 +170,34 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
                 ok = await _ping_provider(prov)
                 circuit = state.circuits.get(name)
                 if circuit is not None:
-                    if ok:
-                        circuit.record_success()
-                    else:
-                        circuit.record_failure()
+                    circuit.record_probe(ok)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        global _client, _store, _reqlog, _cost
-        _client = httpx.AsyncClient(
+        nonlocal client, store, reqlog, cost, writer
+        client = httpx.AsyncClient(
             timeout=httpx.Timeout(120.0, connect=10.0),
             limits=httpx.Limits(max_connections=200),
         )
         if db_path:
-            _store = UsageStore(db_path)
-            _reqlog = RequestLog(db_path)
-            _cost = CostTracker(db_path)
+            writer = BatchWriter(db_path)
+            store = UsageStore(db_path, writer=writer)
+            reqlog = RequestLog(db_path, writer=writer)
+            cost = CostTracker(db_path, writer=writer)
         health_task = asyncio.create_task(_health_loop())
         try:
             yield
         finally:
             health_task.cancel()
-            await _client.aclose()
-            _client = None
-            for obj in (_store, _reqlog, _cost):
+            await client.aclose()
+            client = None
+            if writer is not None:
+                writer.close()
+            for obj in (store, reqlog, cost):
                 if obj is not None:
                     obj.close()
-            _store = _reqlog = _cost = None
+            store = reqlog = cost = None
+            writer = None
             config_store.close()
 
     app = FastAPI(
@@ -167,66 +221,130 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
             raise HTTPException(status_code=401, detail="invalid admin key")
 
     # ---------- 上游转发 ----------
-    async def _forward_nonstream(cand: Candidate, payload: dict, model_name: str, url: str, ctx: dict) -> dict:
+    async def _forward_nonstream(cand: Candidate, payload: dict, model_name: str, url: str, ctx: dict, log_request=None) -> JSONResponse:
+        # 每次上游尝试生成独立 req_id，避免多候选重试时日志 req_id 冲突
+        ctx["req_id"] = uuid.uuid4().hex
         start = time.time()
         headers = cand.provider.headers(cand.api_key)
         key_label = mask_key(cand.api_key)
+        request_for_log = log_request if log_request is not None else payload
         try:
-            resp = await _client.post(url, json=payload, headers=headers)
+            resp = await client.post(url, json=payload, headers=headers, timeout=_timeout_for(cand.provider))
         except httpx.HTTPError as exc:
             _record_stats(model_name, cand.provider_name, "error", key_label=key_label)
-            _log_request(ctx, cand.provider_name, model_name, key_label, "error", None, 0.0, payload, None, str(exc))
+            _log_request(ctx, cand.provider_name, model_name, key_label, "error", None, 0.0, request_for_log, None, str(exc), upstream_model=cand.upstream_model)
             raise UpstreamError(None, str(exc))
 
         latency = (time.time() - start) * 1000
         if resp.status_code >= 400:
             _record_stats(model_name, cand.provider_name, "error", latency_ms=latency, key_label=key_label)
-            _log_request(ctx, cand.provider_name, model_name, key_label, "error", resp.status_code, latency, payload, None, resp.text[:500])
+            _log_request(ctx, cand.provider_name, model_name, key_label, "error", resp.status_code, latency, request_for_log, None, resp.text[:500], upstream_model=cand.upstream_model)
             raise UpstreamError(resp.status_code, resp.text[:500])
 
         try:
             data = resp.json()
         except Exception:
-            data = {"raw": resp.text}
+            msg = f"upstream returned non-JSON response with status {resp.status_code}: {resp.text[:200]}"
+            _record_stats(model_name, cand.provider_name, "error", latency_ms=latency, key_label=key_label)
+            _log_request(ctx, cand.provider_name, model_name, key_label, "error", 502, latency, request_for_log, None, msg, upstream_model=cand.upstream_model)
+            raise UpstreamError(502, msg)
+
         usage = data.get("usage") or {}
         prompt = int(usage.get("prompt_tokens", 0) or 0)
         completion = int(usage.get("completion_tokens", 0) or 0)
         _record_stats(model_name, cand.provider_name, "ok", prompt=prompt, completion=completion, latency_ms=latency, key_label=key_label)
-        _log_request(ctx, cand.provider_name, model_name, key_label, "ok", 200, latency, payload, data, None)
-        return data
+        _log_request(ctx, cand.provider_name, model_name, key_label, "ok", 200, latency, request_for_log, data, None, upstream_model=cand.upstream_model)
 
-    async def _stream(cand: Candidate, payload: dict, model_name: str, ctx: dict):
+        headers_out = _upstream_headers(resp)
+        headers_out["X-Request-ID"] = ctx["req_id"]
+        return JSONResponse(data, headers=headers_out)
+
+    async def _stream(cand: Candidate, payload: dict, model_name: str, ctx: dict, log_request=None) -> StreamingResponse:
+        # 每次上游尝试生成独立 req_id，避免多候选重试时日志 req_id 冲突
+        ctx["req_id"] = uuid.uuid4().hex
         start = time.time()
         headers = cand.provider.headers(cand.api_key)
         key_label = mask_key(cand.api_key)
-        req = _client.build_request("POST", cand.provider.chat_url, json=payload, headers=headers)
+        request_for_log = log_request if log_request is not None else payload
+
+        async def _send(payload_to_send: dict):
+            req = client.build_request(
+                "POST", cand.provider.chat_url, json=payload_to_send, headers=headers,
+                timeout=_timeout_for(cand.provider),
+            )
+            return await client.send(req, stream=True)
+
         try:
-            resp = await _client.send(req, stream=True)
+            resp = await _send(payload)
         except httpx.HTTPError as exc:
             _record_stats(model_name, cand.provider_name, "error", key_label=key_label)
-            _log_request(ctx, cand.provider_name, model_name, key_label, "error", None, 0.0, payload, None, str(exc))
+            _log_request(ctx, cand.provider_name, model_name, key_label, "error", None, 0.0, request_for_log, None, str(exc), upstream_model=cand.upstream_model)
             raise UpstreamError(None, str(exc))
+
+        # 部分厂商（DashScope/GLM 等）不接受 stream_options，返回 400 时去掉后重试一次
+        if resp.status_code == 400 and payload.get("stream_options"):
+            await resp.aclose()
+            retry_payload = {k: v for k, v in payload.items() if k != "stream_options"}
+            try:
+                resp = await _send(retry_payload)
+            except httpx.HTTPError as exc:
+                _record_stats(model_name, cand.provider_name, "error", key_label=key_label)
+                _log_request(ctx, cand.provider_name, model_name, key_label, "error", None, 0.0, request_for_log, None, str(exc), upstream_model=cand.upstream_model)
+                raise UpstreamError(None, str(exc))
 
         if resp.status_code >= 400:
             raw = await resp.aread()
             await resp.aclose()
             latency = (time.time() - start) * 1000
             _record_stats(model_name, cand.provider_name, "error", latency_ms=latency, key_label=key_label)
-            _log_request(ctx, cand.provider_name, model_name, key_label, "error", resp.status_code, latency, payload, None, raw[:500].decode("utf-8", "replace"))
+            _log_request(ctx, cand.provider_name, model_name, key_label, "error", resp.status_code, latency, request_for_log, None, raw[:500].decode("utf-8", "replace"), upstream_model=cand.upstream_model)
             raise UpstreamError(resp.status_code, raw[:500].decode("utf-8", "replace"))
 
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        stream_error = None
+        buffer = b""
+
         async def gen():
+            nonlocal usage, stream_error, buffer
             try:
                 async for chunk in resp.aiter_bytes():
+                    buffer += chunk
+                    while b"\n" in buffer:
+                        line, buffer = buffer.split(b"\n", 1)
+                        usage = _extract_stream_usage(line, usage)
                     yield chunk
+                if buffer:
+                    usage = _extract_stream_usage(buffer, usage)
+            except Exception as exc:
+                stream_error = str(exc)
+                err_payload = json.dumps(
+                    {"error": {"message": stream_error, "type": "upstream_stream_error"}},
+                    ensure_ascii=False,
+                )
+                yield f"data: {err_payload}\n\n".encode("utf-8")
             finally:
                 await resp.aclose()
+                latency = (time.time() - start) * 1000
+                _record_stats(
+                    model_name, cand.provider_name,
+                    "error" if stream_error else "ok",
+                    prompt=usage["prompt_tokens"], completion=usage["completion_tokens"],
+                    latency_ms=latency, key_label=key_label,
+                )
+                _log_request(
+                    ctx, cand.provider_name, model_name, key_label,
+                    "error" if stream_error else "ok", 200 if not stream_error else None, latency,
+                    request_for_log, {"stream": True, "usage": usage}, stream_error,
+                    upstream_model=cand.upstream_model,
+                )
 
-        _record_stats(model_name, cand.provider_name, "ok", latency_ms=(time.time() - start) * 1000, key_label=key_label)
-        _log_request(ctx, cand.provider_name, model_name, key_label, "ok", 200, (time.time() - start) * 1000, payload, {"stream": True}, None)
-        return StreamingResponse(gen(), media_type="text/event-stream")
+        headers_out = _upstream_headers(resp)
+        headers_out["X-Request-ID"] = ctx["req_id"]
+        return StreamingResponse(gen(), media_type="text/event-stream", headers=headers_out)
 
-    async def _forward_transcription(cand: Candidate, model_name: str, content: bytes, filename: str, content_type: str, extra: dict, ctx: dict):
+    async def _forward_transcription(cand: Candidate, model_name: str, content: bytes, filename: str, content_type: str, extra: dict, ctx: dict) -> JSONResponse:
+        # 每次上游尝试生成独立 req_id，避免多候选重试时日志 req_id 冲突
+        ctx["req_id"] = uuid.uuid4().hex
         start = time.time()
         key_label = mask_key(cand.api_key)
         headers = {}
@@ -234,26 +352,33 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
             headers["Authorization"] = f"Bearer {cand.api_key}"
         payload_data = {**extra, "model": cand.upstream_model}
         files = {"file": (filename, content, content_type)}
+        request_for_log = {**extra, "model": model_name}
         try:
-            resp = await _client.post(cand.provider.transcriptions_url, data=payload_data, files=files, headers=headers)
+            resp = await client.post(cand.provider.transcriptions_url, data=payload_data, files=files, headers=headers, timeout=_timeout_for(cand.provider))
         except httpx.HTTPError as exc:
             _record_stats(model_name, cand.provider_name, "error", key_label=key_label)
-            _log_request(ctx, cand.provider_name, model_name, key_label, "error", None, 0.0, {"filename": filename, **extra}, None, str(exc))
+            _log_request(ctx, cand.provider_name, model_name, key_label, "error", None, 0.0, request_for_log, None, str(exc), upstream_model=cand.upstream_model)
             raise UpstreamError(None, str(exc))
 
         latency = (time.time() - start) * 1000
         if resp.status_code >= 400:
             _record_stats(model_name, cand.provider_name, "error", latency_ms=latency, key_label=key_label)
-            _log_request(ctx, cand.provider_name, model_name, key_label, "error", resp.status_code, latency, {"filename": filename, **extra}, None, resp.text[:500])
+            _log_request(ctx, cand.provider_name, model_name, key_label, "error", resp.status_code, latency, request_for_log, None, resp.text[:500], upstream_model=cand.upstream_model)
             raise UpstreamError(resp.status_code, resp.text[:500])
 
         try:
             data = resp.json()
         except Exception:
-            data = {"raw": resp.text}
+            msg = f"upstream returned non-JSON response with status {resp.status_code}: {resp.text[:200]}"
+            _record_stats(model_name, cand.provider_name, "error", latency_ms=latency, key_label=key_label)
+            _log_request(ctx, cand.provider_name, model_name, key_label, "error", 502, latency, request_for_log, None, msg, upstream_model=cand.upstream_model)
+            raise UpstreamError(502, msg)
+
         _record_stats(model_name, cand.provider_name, "ok", latency_ms=latency, key_label=key_label)
-        _log_request(ctx, cand.provider_name, model_name, key_label, "ok", 200, latency, {"filename": filename, **extra}, data, None)
-        return data
+        _log_request(ctx, cand.provider_name, model_name, key_label, "ok", 200, latency, request_for_log, data, None, upstream_model=cand.upstream_model)
+        headers_out = _upstream_headers(resp)
+        headers_out["X-Request-ID"] = ctx["req_id"]
+        return JSONResponse(data, headers=headers_out)
 
     async def _try_all(cands: list[Candidate], model_name: str, fn):
         last: Optional[UpstreamError] = None
@@ -279,10 +404,16 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
                 return result
             except UpstreamError as exc:
                 last = exc
-                if is_retryable(exc.status) and circuit is not None:
-                    circuit.record_failure()
-                if not is_retryable(exc.status):
-                    break
+                if is_key_error(exc.status):
+                    # 401/403/429：Key 维度问题 → 换下一个 Key
+                    continue
+                if is_retryable(exc.status):
+                    # 连接错误/5xx：Provider 维度问题 → 换下一个 Provider
+                    if circuit is not None:
+                        circuit.record_failure()
+                    continue
+                # 400/404/422：请求本身有问题，换 Key/Provider 都无济于事
+                break
 
         if not attempted:
             if rate_limited and not circuit_open:
@@ -298,16 +429,17 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
         cands = state.router.candidates(body.model)
         if not cands:
             raise HTTPException(status_code=404, detail=f"unknown model: {body.model}")
-        payload = body.model_dump(exclude_none=True)
-        if body.stream:
-            payload.setdefault("stream_options", {"include_usage": True})
-        ctx = {"req_id": uuid.uuid4().hex, "endpoint": "/v1/chat/completions"}
+        public_payload = body.model_dump(exclude_none=True)
+        if body.stream and state.stream_include_usage:
+            public_payload.setdefault("stream_options", {"include_usage": True})
+        ctx = {"endpoint": "/v1/chat/completions"}
 
         async def fn(cand: Candidate):
-            payload["model"] = cand.upstream_model
+            # 每次用独立的副本，绝不 mutate 原始对外 payload（否则日志/重放会拿到上游模型名）
+            upstream_payload = {**public_payload, "model": cand.upstream_model}
             if body.stream:
-                return await _stream(cand, payload, body.model, ctx)
-            return JSONResponse(await _forward_nonstream(cand, payload, body.model, cand.provider.chat_url, ctx))
+                return await _stream(cand, upstream_payload, body.model, ctx, log_request=public_payload)
+            return await _forward_nonstream(cand, upstream_payload, body.model, cand.provider.chat_url, ctx, log_request=public_payload)
 
         return await _try_all(cands, body.model, fn)
 
@@ -315,12 +447,12 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
         cands = state.router.candidates(body.model)
         if not cands:
             raise HTTPException(status_code=404, detail=f"unknown embedding model: {body.model}")
-        payload = body.model_dump(exclude_none=True)
-        ctx = {"req_id": uuid.uuid4().hex, "endpoint": "/v1/embeddings"}
+        public_payload = body.model_dump(exclude_none=True)
+        ctx = {"endpoint": "/v1/embeddings"}
 
         async def fn(cand: Candidate):
-            payload["model"] = cand.upstream_model
-            return JSONResponse(await _forward_nonstream(cand, payload, body.model, cand.provider.embeddings_url, ctx))
+            upstream_payload = {**public_payload, "model": cand.upstream_model}
+            return await _forward_nonstream(cand, upstream_payload, body.model, cand.provider.embeddings_url, ctx, log_request=public_payload)
 
         return await _try_all(cands, body.model, fn)
 
@@ -342,23 +474,33 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
             "models": len(state.models),
         }
 
+    @app.get("/readyz")
+    async def readyz():
+        """就绪检查：配置已加载且至少有一个可用的 Provider Key。"""
+        ready = bool(state.providers) and any(p.api_keys for p in state.providers.values())
+        if not ready:
+            raise HTTPException(status_code=503, detail="not ready: no providers with api keys")
+        return {"status": "ready", "providers": len(state.providers), "models": len(state.models)}
+
     @app.get("/metrics")
-    async def metrics():
+    async def metrics_route():
         gauges = [("polygate_up", {}, 1.0)]
         for name, c in state.circuits.items():
             s = 0 if c.state == "closed" else (1 if c.state == "open" else 2)
             gauges.append(("polygate_provider_circuit_state", {"provider": name}, s))
         return Response(
-            content=_metrics.render(extra_gauges=gauges),
+            content=metrics.render(extra_gauges=gauges),
             media_type="text/plain; version=0.0.4; charset=utf-8",
         )
 
     @app.get("/v1/models")
     async def list_models(request: Request):
         _check_auth(request)
+        # 只列出 chat 模型：embeddings / audio 模型不该出现在 OpenAI SDK 的模型列表里
         data = [
-            {"id": name, "object": "model", "owned_by": routes[0].provider, "kind": state.model_kinds.get(name, "chat")}
+            {"id": name, "object": "model", "owned_by": routes[0].provider}
             for name, routes in state.models.items()
+            if state.model_kinds.get(name, "chat") == "chat"
         ]
         return {"object": "list", "data": data}
 
@@ -463,33 +605,33 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
     @app.get("/v1/usage")
     async def usage(request: Request):
         _check_admin(request)
-        snap = _stats.snapshot()
-        snap["persisted_total_calls"] = _store.total_calls() if _store is not None else 0
+        snap = stats.snapshot()
+        snap["persisted_total_calls"] = store.total_calls() if store is not None else 0
         return snap
 
     @app.get("/v1/usage/history")
     async def usage_history(request: Request, days: int = Query(7, ge=1, le=90)):
         _check_admin(request)
-        return _store.daily_summary(days) if _store is not None else []
+        return store.daily_summary(days) if store is not None else []
 
     @app.get("/v1/costs")
     async def costs(request: Request):
         _check_admin(request)
-        if _cost is None:
+        if cost is None:
             raise HTTPException(status_code=503, detail="cost tracking disabled (no db_path)")
-        return _cost.summary()
+        return cost.summary()
 
     @app.get("/v1/requests")
     async def list_requests(request: Request, limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0)):
         _check_admin(request)
-        return _reqlog.list(limit, offset) if _reqlog is not None else []
+        return reqlog.list(limit, offset) if reqlog is not None else []
 
     @app.get("/v1/requests/{req_id}")
     async def get_request(req_id: str, request: Request):
         _check_admin(request)
-        if _reqlog is None:
+        if reqlog is None:
             raise HTTPException(status_code=503, detail="request logging disabled")
-        entry = _reqlog.get(req_id)
+        entry = reqlog.get(req_id)
         if not entry:
             raise HTTPException(status_code=404, detail=f"request not found: {req_id}")
         return entry
@@ -497,9 +639,9 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
     @app.post("/v1/requests/{req_id}/replay")
     async def replay(req_id: str, request: Request):
         _check_admin(request)
-        if _reqlog is None:
+        if reqlog is None:
             raise HTTPException(status_code=503, detail="request logging disabled")
-        entry = _reqlog.get(req_id)
+        entry = reqlog.get(req_id)
         if not entry or not entry.get("request"):
             raise HTTPException(status_code=404, detail=f"request not found: {req_id}")
         endpoint = entry["endpoint"]
@@ -555,14 +697,11 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
         if not cands:
             raise HTTPException(status_code=404, detail=f"unknown model: {model}")
 
-        ctx = {"req_id": uuid.uuid4().hex, "endpoint": "/v1/audio/transcriptions"}
+        ctx = {"endpoint": "/v1/audio/transcriptions"}
 
         async def fn(cand: Candidate):
-            return JSONResponse(await _forward_transcription(cand, model, content, filename, content_type, extra, ctx))
+            return await _forward_transcription(cand, model, content, filename, content_type, extra, ctx)
 
         return await _try_all(cands, model, fn)
 
     return app
-
-
-app = create_app()

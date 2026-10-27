@@ -81,7 +81,7 @@ document.getElementById('key').value=k();
 function saveKey(){localStorage.setItem('polygate_key',document.getElementById('key').value.trim());refresh();}
 function H(){return {'Authorization':'Bearer '+k()};}
 async function getJSON(path){const r=await fetch(path,{headers:H()});if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}
-function pill(s){const c=s==='closed'?'ok':(s==='open'?'err':'warn');return '<span class="pill '+c+'">'+s+'</span>';}
+function pill(s){const c=s==='closed'?'ok':(s==='open'?'err':'warn');return '<span class="pill '+c+'">'+esc(s)+'</span>';}
 async function refresh(){
   const st=document.getElementById('status');
   try{
@@ -91,35 +91,35 @@ async function refresh(){
     const pt=document.querySelector('#providers tbody');pt.innerHTML='';
     for(const [name,p] of Object.entries(prov.providers)){
       const rl=p.rate_limit?p.rate_limit[0]:'—';
-      pt.insertAdjacentHTML('beforeend','<tr><td>'+name+'</td><td>'+pill(p.state)+'</td><td>'+p.consecutive_failures+'</td><td>'+p.keys+'</td><td>'+rl+'</td></tr>');
+      pt.insertAdjacentHTML('beforeend','<tr><td>'+esc(name)+'</td><td>'+pill(p.state)+'</td><td>'+esc(p.consecutive_failures)+'</td><td>'+esc(p.keys)+'</td><td>'+esc(rl)+'</td></tr>');
     }
     const mt=document.querySelector('#models tbody');mt.innerHTML='';
     for(const m of prov.models){
-      const routes=m.routes.map(function(r){return r.provider+':'+r.model+'('+r.weight+')';}).join(', ');
-      mt.insertAdjacentHTML('beforeend','<tr><td>'+m.id+'</td><td>'+m.kind+'</td><td class="muted">'+routes+'</td></tr>');
+      const routes=m.routes.map(function(r){return esc(r.provider)+':'+esc(r.model)+'('+esc(r.weight)+')';}).join(', ');
+      mt.insertAdjacentHTML('beforeend','<tr><td>'+esc(m.id)+'</td><td>'+esc(m.kind)+'</td><td class="muted">'+routes+'</td></tr>');
     }
     const ut=document.querySelector('#usage tbody');ut.innerHTML='';
     for(const [m,u] of Object.entries(usage.models)){
-      ut.insertAdjacentHTML('beforeend','<tr><td>'+m+'</td><td>'+u.calls+'</td><td>'+u.errors+'</td><td>'+u.total_tokens+'</td><td>'+u.avg_latency_ms+'ms</td></tr>');
+      ut.insertAdjacentHTML('beforeend','<tr><td>'+esc(m)+'</td><td>'+esc(u.calls)+'</td><td>'+esc(u.errors)+'</td><td>'+esc(u.total_tokens)+'</td><td>'+esc(u.avg_latency_ms)+'ms</td></tr>');
     }
     let hist=[];
     try{hist=await getJSON('/v1/usage/history?days=7');}catch(e){}
     const ht=document.querySelector('#history tbody');ht.innerHTML='';
     for(const h of hist){
-      ht.insertAdjacentHTML('beforeend','<tr><td>'+h.day+'</td><td>'+h.calls+'</td><td>'+h.errors+'</td><td>'+(h.prompt_tokens+h.completion_tokens)+'</td></tr>');
+      ht.insertAdjacentHTML('beforeend','<tr><td>'+esc(h.day)+'</td><td>'+esc(h.calls)+'</td><td>'+esc(h.errors)+'</td><td>'+esc(h.prompt_tokens+h.completion_tokens)+'</td></tr>');
     }
     let costs=[];
     try{costs=await getJSON('/v1/costs');}catch(e){}
     document.getElementById('cost-total').textContent='总成本: '+costs.total;
     const cst=document.querySelector('#costs tbody');cst.innerHTML='';
     for(const c of (costs.by_key||[])){
-      cst.insertAdjacentHTML('beforeend','<tr><td>'+c.key+'</td><td>'+c.cost+'</td><td>'+c.calls+'</td><td>'+(c.prompt_tokens+c.completion_tokens)+'</td></tr>');
+      cst.insertAdjacentHTML('beforeend','<tr><td>'+esc(c.key)+'</td><td>'+esc(c.cost)+'</td><td>'+esc(c.calls)+'</td><td>'+esc(c.prompt_tokens+c.completion_tokens)+'</td></tr>');
     }
     let reqs=[];
     try{reqs=await getJSON('/v1/requests?limit=10');}catch(e){}
     const rt=document.querySelector('#requests tbody');rt.innerHTML='';
     for(const r of reqs){
-      rt.insertAdjacentHTML('beforeend','<tr><td>'+r.endpoint+'</td><td>'+r.model+'</td><td>'+(r.provider||'')+'</td><td>'+r.status+'</td><td>'+r.latency_ms+'ms</td></tr>');
+      rt.insertAdjacentHTML('beforeend','<tr><td>'+esc(r.endpoint)+'</td><td>'+esc(r.model)+'</td><td>'+esc(r.provider||'')+'</td><td>'+esc(r.status)+'</td><td>'+esc(r.latency_ms)+'ms</td></tr>');
     }
     st.textContent='已连接 '+new Date().toLocaleTimeString();
     st.className='ok';

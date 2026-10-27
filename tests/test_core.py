@@ -1,7 +1,9 @@
 """核心逻辑单元测试（无需网络）。"""
 
+import pytest
+
 from polygate.config import load_config
-from polygate.errors import is_retryable
+from polygate.errors import is_key_error, is_retryable
 from polygate.providers import Provider
 from polygate.router import Route, Router
 from polygate.stats import Stats
@@ -11,7 +13,8 @@ def test_env_expansion(tmp_path, monkeypatch):
     monkeypatch.setenv("FOO_KEY", "secret123")
     p = tmp_path / "c.yaml"
     p.write_text("auth:\n  api_key: ${FOO_KEY}\nmissing: ${NOT_SET}\n", encoding="utf-8")
-    cfg = load_config(p)
+    with pytest.warns(RuntimeWarning, match="NOT_SET"):
+        cfg = load_config(p)
     assert cfg["auth"]["api_key"] == "secret123"
     assert cfg["missing"] == ""
 
@@ -52,6 +55,18 @@ def test_retryable():
     assert not is_retryable(401)
     assert not is_retryable(403)
     assert not is_retryable(404)
+
+
+def test_key_error():
+    # 401/403/429 应触发换 Key；其余 4xx 不是 Key 维度问题
+    assert is_key_error(401)
+    assert is_key_error(403)
+    assert is_key_error(429)
+    assert not is_key_error(400)
+    assert not is_key_error(404)
+    assert not is_key_error(422)
+    assert not is_key_error(500)
+    assert not is_key_error(None)
 
 
 def test_stats():

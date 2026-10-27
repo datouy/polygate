@@ -52,6 +52,7 @@ class MockUpstream(BaseHTTPRequestHandler):
             sse = (
                 b'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n'
                 b'data: {"choices":[{"delta":{"content":" world"}}]}\n\n'
+                b'data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}\n\n'
                 b"data: [DONE]\n\n"
             )
             self.send_header("Content-Type", "text/event-stream")
@@ -111,7 +112,7 @@ def test_e2e(tmp_path):
             assert c.get("/healthz").status_code == 200
 
             models = c.get("/v1/models").json()
-            assert {m["id"] for m in models["data"]} == {"mock-chat", "mock-emb", "mock-asr"}
+            assert {m["id"] for m in models["data"]} == {"mock-chat"}
 
             # 非流式对话
             r = c.post(
@@ -163,6 +164,8 @@ def test_e2e(tmp_path):
             # 用量统计（含持久化）
             u = c.get("/v1/usage").json()
             assert u["models"]["mock-chat"]["calls"] >= 2
+            # 流式 usage 已在流结束后解析记账（非流式 completion=2，流式 completion=3 → >=3 证明流式已记）
+            assert u["models"]["mock-chat"]["completion_tokens"] >= 3
             assert u["persisted_total_calls"] >= 4
 
             # 请求日志与重放
@@ -174,7 +177,7 @@ def test_e2e(tmp_path):
             for item in reqs:
                 if item["endpoint"] == "/v1/chat/completions" and item["status"] == "ok":
                     d = c.get(f"/v1/requests/{item['req_id']}").json()
-                    if d.get("response") != {"stream": True}:
+                    if not (d.get("request") or {}).get("stream"):
                         chat_req = item
                         break
             assert chat_req is not None

@@ -1,0 +1,16 @@
+services:
+  polygate:
+    build: .
+    container_name: polygate
+    ports:
+      - "8000:8000"
+    environment:
+      POLYGATE_PORT: "8000"
+      POLYGATE_CONFIG: /app/config.yaml
+      # 上游 Key 通过环境变量注入，config.yaml 里用 ${DEEPSEEK_API_KEY} 等引用
+      # DEEPSEEK_API_KEY: ""
+      # DASHSCOPE_API_KEY: ""
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/app/data
+    restart: unless-stopped
