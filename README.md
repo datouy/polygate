@@ -107,6 +107,7 @@ docker compose up -d --build
 ```yaml
 db_path: polygate.db             # SQLite：用量持久化 + 配置覆盖（留空则禁用）· persistence & config overrides
 stream_include_usage: true       # 流式自动注入 include_usage 统计 token（部分厂商不兼容可关）· stream usage injection
+log_retention_days: 0            # 日志保留天数（0=永久）；>0 定期清理过旧记录，防止 SQLite 无限增长 · log retention
 auth:
   api_key: "change-me"           # 网关入口密钥 · gateway key
   admin_key: ""                  # 管理端口密钥（留空复用 api_key）· admin key

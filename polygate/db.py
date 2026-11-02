@@ -14,13 +14,15 @@ import threading
 from typing import Iterable
 
 _SENTINEL = object()
+_MAX_QUEUE = 100_000  # 写入队列上限：超过后丢弃写入，避免磁盘异常时内存无界增长
 
 
 class BatchWriter:
     """单连接 + 后台批量写。所有写操作通过 ``enqueue`` 排队，由后台线程批量提交。"""
 
     def __init__(self, db_path: str):
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        # isolation_level=None 走显式 BEGIN/COMMIT，避免 sqlite3 隐式事务与手动 BEGIN 混用
+        self._conn = sqlite3.connect(db_path, check_same_thread=False, isolation_level=None)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute("PRAGMA synchronous=NORMAL")
@@ -28,9 +30,15 @@ class BatchWriter:
         self._queue: queue.Queue = queue.Queue()
         self._stop = threading.Event()
         self._started = threading.Event()
+        self._dropped = 0
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         self._started.wait()
+
+    @property
+    def dropped(self) -> int:
+        """因队列满被丢弃的写入条数。"""
+        return self._dropped
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -53,6 +61,9 @@ class BatchWriter:
             self._conn.commit()
 
     def enqueue(self, sql: str, params: tuple = ()) -> None:
+        if self._queue.qsize() >= _MAX_QUEUE:
+            self._dropped += 1
+            return
         self._queue.put((sql, params))
 
     def flush(self, timeout: float = 5.0) -> None:
@@ -82,7 +93,12 @@ class BatchWriter:
                     continue
                 batch.append(nxt)
             if batch:
-                self._flush(batch)
+                try:
+                    self._flush(batch)
+                except Exception:
+                    # 单批写入失败（磁盘满 / 约束冲突等）不应杀死后台写入线程，
+                    # 否则后续写入会永久堆积；这里丢弃该批并继续。
+                    continue
 
     def _flush(self, batch: Iterable[tuple]) -> None:
         with self._lock:

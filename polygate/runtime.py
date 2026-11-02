@@ -119,6 +119,9 @@ class RuntimeState:
         # stream_options.include_usage 自动注入开关（部分国产厂商不兼容，可关）。
         self.stream_include_usage = bool(cfg.get("stream_include_usage", True))
 
+        # 日志保留天数（0 = 永久保留）。>0 时会定期清理 calls/requests/costs 中过旧数据。
+        self.log_retention_days = float(cfg.get("log_retention_days", 0) or 0)
+
     def editable(self) -> dict:
         """给管理面板用的可编辑视图（Key 已脱敏，绝不返回明文）。"""
         return {

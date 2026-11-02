@@ -97,12 +97,13 @@ class RequestLog:
 
     def _migrate(self) -> None:
         """为旧库补齐 upstream_model / truncated 两列。"""
-        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(requests)")}
-        if "upstream_model" not in cols:
-            self._conn.execute("ALTER TABLE requests ADD COLUMN upstream_model TEXT")
-        if "truncated" not in cols:
-            self._conn.execute("ALTER TABLE requests ADD COLUMN truncated INTEGER NOT NULL DEFAULT 0")
-        self._conn.commit()
+        with self._lock:
+            cols = {r[1] for r in self._conn.execute("PRAGMA table_info(requests)")}
+            if "upstream_model" not in cols:
+                self._conn.execute("ALTER TABLE requests ADD COLUMN upstream_model TEXT")
+            if "truncated" not in cols:
+                self._conn.execute("ALTER TABLE requests ADD COLUMN truncated INTEGER NOT NULL DEFAULT 0")
+            self._conn.commit()
 
     def log(
         self,

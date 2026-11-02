@@ -81,3 +81,21 @@ def test_stats():
     assert m["completion_tokens"] == 5
     assert m["total_tokens"] == 15
     assert snap["calls_by_provider"]["p"] == 2
+
+
+def test_extract_stream_usage():
+    from polygate.server import _extract_stream_usage
+
+    usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    # 普通 delta 行（不含 usage）不应改变计数
+    usage = _extract_stream_usage(b'data: {"choices":[{"delta":{"content":"hi"}}]}\n', usage)
+    assert usage["total_tokens"] == 0
+    # 末尾 usage 行应被解析
+    usage = _extract_stream_usage(
+        b'data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}', usage
+    )
+    assert usage == {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}
+    # [DONE] 与非 data 行忽略
+    usage = _extract_stream_usage(b"data: [DONE]", usage)
+    usage = _extract_stream_usage(b"", usage)
+    assert usage["completion_tokens"] == 3

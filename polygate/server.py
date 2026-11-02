@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import os
 import time
@@ -28,6 +29,7 @@ from .cost import CostTracker, compute_cost
 from .db import BatchWriter
 from .errors import UpstreamError, is_key_error, is_retryable
 from .metrics import Metrics
+from .ratelimit import RateLimiter
 from .requestlog import RequestLog
 from .router import Candidate
 from .runtime import RuntimeState, mask_key
@@ -83,6 +85,9 @@ def _extract_stream_usage(line: bytes, usage: dict) -> dict:
         return usage
     data = line[5:].strip()
     if not data or data == b"[DONE]":
+        return usage
+    # 绝大多数 delta 行不含 usage：先做子串判断，避免对每个 token 块都做 json.loads
+    if b'"usage"' not in data:
         return usage
     try:
         obj = json.loads(data)
@@ -166,18 +171,37 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
             await asyncio.sleep(max(5.0, state.health_interval))
             if not state.health_enabled:
                 continue
-            for name, prov in list(state.providers.items()):
-                ok = await _ping_provider(prov)
+            items = list(state.providers.items())
+            if not items:
+                continue
+            # 并发探测：单个 Provider 卡住不会拖慢其它 Provider 的探测
+            results = await asyncio.gather(*(_ping_provider(p) for _, p in items), return_exceptions=True)
+            for (name, _), ok in zip(items, results):
                 circuit = state.circuits.get(name)
                 if circuit is not None:
-                    circuit.record_probe(ok)
+                    circuit.record_probe(ok is True)
+
+    async def _cleanup_loop():
+        """按 log_retention_days 定期清理过旧的 calls / requests / costs，避免库无限增长。"""
+        while True:
+            await asyncio.sleep(3600)
+            days = state.log_retention_days
+            if not days or days <= 0 or writer is None:
+                continue
+            cutoff = time.time() - days * 86400
+            try:
+                writer.enqueue("DELETE FROM calls WHERE ts < ?", (cutoff,))
+                writer.enqueue("DELETE FROM requests WHERE ts < ?", (cutoff,))
+                writer.enqueue("DELETE FROM costs WHERE ts < ?", (cutoff,))
+            except Exception:
+                pass
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         nonlocal client, store, reqlog, cost, writer
         client = httpx.AsyncClient(
             timeout=httpx.Timeout(120.0, connect=10.0),
-            limits=httpx.Limits(max_connections=200),
+            limits=httpx.Limits(max_connections=200, max_keepalive_connections=100),
         )
         if db_path:
             writer = BatchWriter(db_path)
@@ -185,10 +209,20 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
             reqlog = RequestLog(db_path, writer=writer)
             cost = CostTracker(db_path, writer=writer)
         health_task = asyncio.create_task(_health_loop())
+        cleanup_task = asyncio.create_task(_cleanup_loop()) if db_path else None
         try:
             yield
         finally:
-            health_task.cancel()
+            for task in (health_task, cleanup_task):
+                if task is None:
+                    continue
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
             await client.aclose()
             client = None
             if writer is not None:
@@ -212,12 +246,12 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
         key = state.gateway_key
         if not key:
             return
-        if request.headers.get("authorization", "") != f"Bearer {key}":
+        if not hmac.compare_digest(request.headers.get("authorization", ""), f"Bearer {key}"):
             raise HTTPException(status_code=401, detail="invalid gateway api key")
 
     def _check_admin(request: Request) -> None:
         key = state.admin_key
-        if key and request.headers.get("authorization", "") != f"Bearer {key}":
+        if key and not hmac.compare_digest(request.headers.get("authorization", ""), f"Bearer {key}"):
             raise HTTPException(status_code=401, detail="invalid admin key")
 
     # ---------- 上游转发 ----------
@@ -257,7 +291,8 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
 
         headers_out = _upstream_headers(resp)
         headers_out["X-Request-ID"] = ctx["req_id"]
-        return JSONResponse(data, headers=headers_out)
+        # 直接透传上游原始字节，避免「解析成 dict 再重新序列化」的双重开销
+        return Response(content=resp.content, media_type="application/json", headers=headers_out)
 
     async def _stream(cand: Candidate, payload: dict, model_name: str, ctx: dict, log_request=None) -> StreamingResponse:
         # 每次上游尝试生成独立 req_id，避免多候选重试时日志 req_id 冲突
@@ -392,7 +427,13 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
                 continue
             rl = state.rate_limits.get(cand.provider_name)
             if rl:
-                ok = await asyncio.to_thread(state.limiter.allow, f"{cand.provider_name}:{cand.api_key}", rl[0], rl[1])
+                rl_key = f"{cand.provider_name}:{cand.api_key}"
+                limiter = state.limiter
+                if isinstance(limiter, RateLimiter):
+                    # 内存令牌桶是纯 CPU + 线程锁，直接调用；只有 Redis 这种阻塞 IO 才丢线程
+                    ok = limiter.allow(rl_key, rl[0], rl[1])
+                else:
+                    ok = await asyncio.to_thread(limiter.allow, rl_key, rl[0], rl[1])
                 if not ok:
                     rate_limited = True
                     continue
@@ -606,32 +647,40 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
     async def usage(request: Request):
         _check_admin(request)
         snap = stats.snapshot()
-        snap["persisted_total_calls"] = store.total_calls() if store is not None else 0
+        if store is not None:
+            # DB 读取放到线程里，避免大表 COUNT 阻塞事件循环
+            snap["persisted_total_calls"] = await asyncio.to_thread(store.total_calls)
+        else:
+            snap["persisted_total_calls"] = 0
         return snap
 
     @app.get("/v1/usage/history")
     async def usage_history(request: Request, days: int = Query(7, ge=1, le=90)):
         _check_admin(request)
-        return store.daily_summary(days) if store is not None else []
+        if store is None:
+            return []
+        return await asyncio.to_thread(store.daily_summary, days)
 
     @app.get("/v1/costs")
     async def costs(request: Request):
         _check_admin(request)
         if cost is None:
             raise HTTPException(status_code=503, detail="cost tracking disabled (no db_path)")
-        return cost.summary()
+        return await asyncio.to_thread(cost.summary)
 
     @app.get("/v1/requests")
     async def list_requests(request: Request, limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0)):
         _check_admin(request)
-        return reqlog.list(limit, offset) if reqlog is not None else []
+        if reqlog is None:
+            return []
+        return await asyncio.to_thread(reqlog.list, limit, offset)
 
     @app.get("/v1/requests/{req_id}")
     async def get_request(req_id: str, request: Request):
         _check_admin(request)
         if reqlog is None:
             raise HTTPException(status_code=503, detail="request logging disabled")
-        entry = reqlog.get(req_id)
+        entry = await asyncio.to_thread(reqlog.get, req_id)
         if not entry:
             raise HTTPException(status_code=404, detail=f"request not found: {req_id}")
         return entry
@@ -641,7 +690,7 @@ def create_app(config: Optional[str | dict] = None) -> FastAPI:
         _check_admin(request)
         if reqlog is None:
             raise HTTPException(status_code=503, detail="request logging disabled")
-        entry = reqlog.get(req_id)
+        entry = await asyncio.to_thread(reqlog.get, req_id)
         if not entry or not entry.get("request"):
             raise HTTPException(status_code=404, detail=f"request not found: {req_id}")
         endpoint = entry["endpoint"]
