@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from .circuit import CircuitBreaker
+from .alerts import Alerter
+from .circuit import CircuitBreaker, KeyBreaker
+from .clients import parse_client_keys
 from .providers import Provider
 from .ratelimit import RateLimiter
 from .redislimiter import RedisRateLimiter
@@ -76,8 +78,11 @@ class RuntimeState:
 
     def __init__(self, cfg: dict):
         self.circuits: dict[str, CircuitBreaker] = {}
+        self.key_breakers: dict[str, dict[str, KeyBreaker]] = {}
         self.limiter = None
         self._redis_cfg_signature: object = object()
+        self.client_keys: dict = {}
+        self.alerter: Alerter | None = None
         self.reload(cfg)
 
     def reload(self, cfg: dict) -> None:
@@ -105,9 +110,42 @@ class RuntimeState:
             circuits[name] = cb
         self.circuits = circuits
 
+        # Key 级熔断器：认证失效（401/403）的 Key 短期内不再使用。
+        # 保留已有实例，仅新增/移除 Key，避免每次热重载把失败计数归零。
+        key_threshold = int(health_cfg.get("key_failure_threshold", 2))
+        key_cooldown = float(health_cfg.get("key_cooldown", 300.0))
+        key_breakers: dict[str, dict[str, KeyBreaker]] = {}
+        for name, prov in self.providers.items():
+            existing = self.key_breakers.get(name, {})
+            per_provider: dict[str, KeyBreaker] = {}
+            for key in prov.api_keys:
+                kb = existing.get(key)
+                if kb is None:
+                    kb = KeyBreaker(failure_threshold=key_threshold, cooldown_sec=key_cooldown)
+                else:
+                    kb.failure_threshold = key_threshold
+                    kb.cooldown_sec = key_cooldown
+                per_provider[key] = kb
+            key_breakers[name] = per_provider
+        self.key_breakers = key_breakers
+
         auth = cfg.get("auth") or {}
         self.gateway_key = auth.get("api_key") or None
         self.admin_key = auth.get("admin_key") or self.gateway_key
+        self.client_keys = parse_client_keys(auth)
+
+        # 告警：仅在 webhook 变化时重建，避免热重载重复创建/丢连接。
+        alert_cfg = cfg.get("alerting") or {}
+        webhook = str(alert_cfg.get("webhook_url") or "").strip()
+        if webhook:
+            if self.alerter is None or self.alerter.webhook_url != webhook:
+                self.alerter = Alerter(
+                    webhook,
+                    cooldown=float(alert_cfg.get("cooldown", 300.0)),
+                    timeout=float(alert_cfg.get("timeout", 5.0)),
+                )
+        else:
+            self.alerter = None
 
         # 仅当 Redis URL 变化时才重建限流器，避免每次热重载泄漏一个 Redis 连接池。
         redis_cfg = cfg.get("redis")

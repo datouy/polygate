@@ -3,7 +3,7 @@
 import pytest
 
 from polygate.config import load_config
-from polygate.errors import is_key_error, is_retryable
+from polygate.errors import is_client_error, is_key_error, is_rate_limited, is_retryable
 from polygate.providers import Provider
 from polygate.router import Route, Router
 from polygate.stats import Stats
@@ -58,15 +58,39 @@ def test_retryable():
 
 
 def test_key_error():
-    # 401/403/429 应触发换 Key；其余 4xx 不是 Key 维度问题
+    # 401/403 属于 Key 维度问题：应触发换 Key；其余 4xx 不是 Key 维度问题
     assert is_key_error(401)
     assert is_key_error(403)
-    assert is_key_error(429)
     assert not is_key_error(400)
     assert not is_key_error(404)
     assert not is_key_error(422)
     assert not is_key_error(500)
     assert not is_key_error(None)
+
+
+def test_rate_limited_is_separate_from_key_error():
+    """429 是独立的语义：换 Key 有效，但语义上不等于「Key 失效」。
+
+    401/403 表示 Key 无效（应隔离该 Key）；429 表示额度/速率被限
+    （Key 可能仍然有效，换一个 Key 或稍后重试即可）。
+    """
+    assert is_rate_limited(429)
+    assert not is_rate_limited(401)
+    assert not is_rate_limited(500)
+    assert not is_rate_limited(None)
+    assert not is_key_error(429)
+
+
+def test_client_error():
+    """4xx（除 401/403/429）应原样回传客户端，而不是降级成 502。"""
+    assert is_client_error(400)
+    assert is_client_error(404)
+    assert is_client_error(422)
+    assert not is_client_error(401)
+    assert not is_client_error(403)
+    assert not is_client_error(429)
+    assert not is_client_error(500)
+    assert not is_client_error(None)
 
 
 def test_stats():

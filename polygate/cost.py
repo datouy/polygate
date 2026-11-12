@@ -16,9 +16,11 @@ CREATE TABLE IF NOT EXISTS costs (
     model TEXT NOT NULL,
     prompt_tokens INTEGER NOT NULL DEFAULT 0,
     completion_tokens INTEGER NOT NULL DEFAULT 0,
-    cost REAL NOT NULL DEFAULT 0
+    cost REAL NOT NULL DEFAULT 0,
+    client TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_costs_key ON costs(key_label);
+CREATE INDEX IF NOT EXISTS idx_costs_client_ts ON costs(client, ts);
 """
 
 
@@ -46,19 +48,48 @@ class CostTracker:
             self._conn.execute("PRAGMA busy_timeout=5000")
             self._conn.executescript(_SCHEMA)
             self._conn.commit()
+        self._migrate()
 
-    def add(self, key_label: str, model: str, prompt: int, completion: int, cost: float) -> None:
-        sql = (
-            "INSERT INTO costs(ts,key_label,model,prompt_tokens,completion_tokens,cost) "
-            "VALUES(?,?,?,?,?,?)"
-        )
-        params = (time.time(), key_label, model, int(prompt), int(completion), float(cost))
+    def _migrate(self) -> None:
+        """为旧库补齐 client 列。"""
+        with self._lock:
+            cols = {r[1] for r in self._conn.execute("PRAGMA table_info(costs)")}
+            if "client" not in cols:
+                self._conn.execute("ALTER TABLE costs ADD COLUMN client TEXT NOT NULL DEFAULT ''")
+            try:
+                self._conn.execute("CREATE INDEX IF NOT EXISTS idx_costs_client_ts ON costs(client, ts)")
+            except Exception:
+                pass
+            self._conn.commit()
+
+    def add(self, key_label: str, model: str, prompt: int, completion: int, cost: float, client: str = "") -> None:
+        sql = "INSERT INTO costs(ts,key_label,model,prompt_tokens,completion_tokens,cost,client) VALUES(?,?,?,?,?,?,?)"
+        params = (time.time(), key_label, model, int(prompt), int(completion), float(cost), client or "")
         if self._writer is not None:
             self._writer.enqueue(sql, params)
             return
         with self._lock:
             self._conn.execute(sql, params)
             self._conn.commit()
+
+    def spend_since(self, client: str | None = None, since: float | None = None) -> float:
+        """统计某客户端自 since 以来的累计成本（预算检查用）。"""
+        conds: list[str] = []
+        params: list = []
+        if client:
+            conds.append("client = ?")
+            params.append(client)
+        if since is not None:
+            conds.append("ts >= ?")
+            params.append(float(since))
+        where = (" WHERE " + " AND ".join(conds)) if conds else ""
+        sql = f"SELECT COALESCE(SUM(cost),0) FROM costs{where}"
+        if self._writer is not None:
+            row = self._writer.query_one(sql, tuple(params))
+        else:
+            with self._lock:
+                row = self._conn.execute(sql, tuple(params)).fetchone()
+        return float(row[0]) if row else 0.0
 
     def summary(self) -> dict:
         by_key_sql = (
@@ -70,15 +101,21 @@ class CostTracker:
             "FROM costs GROUP BY model ORDER BY SUM(cost) DESC"
         )
         total_sql = "SELECT COALESCE(SUM(cost),0) FROM costs"
+        by_client_sql = (
+            "SELECT client, SUM(cost), SUM(prompt_tokens), SUM(completion_tokens), COUNT(*) "
+            "FROM costs GROUP BY client ORDER BY SUM(cost) DESC"
+        )
         if self._writer is not None:
             by_key = self._writer.query(by_key_sql)
             by_model = self._writer.query(by_model_sql)
             total = self._writer.query_one(total_sql)[0]
+            by_client = self._writer.query(by_client_sql)
         else:
             with self._lock:
                 by_key = self._conn.execute(by_key_sql).fetchall()
                 by_model = self._conn.execute(by_model_sql).fetchall()
                 total = self._conn.execute(total_sql).fetchone()[0]
+                by_client = self._conn.execute(by_client_sql).fetchall()
         return {
             "total": round(total, 6),
             "by_key": [
@@ -100,6 +137,16 @@ class CostTracker:
                     "calls": r[4],
                 }
                 for r in by_model
+            ],
+            "by_client": [
+                {
+                    "client": r[0] or "",
+                    "cost": round(r[1], 6),
+                    "prompt_tokens": r[2],
+                    "completion_tokens": r[3],
+                    "calls": r[4],
+                }
+                for r in by_client
             ],
         }
 

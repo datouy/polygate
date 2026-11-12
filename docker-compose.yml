@@ -7,6 +7,9 @@ services:
     environment:
       POLYGATE_PORT: "8000"
       POLYGATE_CONFIG: /app/config.yaml
+      # 数据库路径必须落在挂载卷 /app/data 内，
+      # 否则容器重建后用量/成本/请求日志/面板配置覆盖全部丢失。
+      POLYGATE_DB_PATH: /app/data/polygate.db
       # 上游 Key 通过环境变量注入，config.yaml 里用 ${DEEPSEEK_API_KEY} 等引用
       # DEEPSEEK_API_KEY: ""
       # DASHSCOPE_API_KEY: ""

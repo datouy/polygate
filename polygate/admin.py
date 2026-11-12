@@ -44,8 +44,9 @@ th{color:var(--muted);font-weight:500}
   <section class="card"><h2>Models</h2><table id="models"><thead><tr><th>模型</th><th>类型</th><th>路由</th></tr></thead><tbody></tbody></table></section>
   <section class="card"><h2>实时用量</h2><table id="usage"><thead><tr><th>模型</th><th>调用</th><th>错误</th><th>Tokens</th><th>平均延迟</th></tr></thead><tbody></tbody></table></section>
   <section class="card"><h2>每日历史</h2><table id="history"><thead><tr><th>日期</th><th>调用</th><th>错误</th><th>Tokens</th></tr></thead><tbody></tbody></table></section>
-  <section class="card"><h2>成本</h2><div id="cost-total" class="muted"></div><table id="costs"><thead><tr><th>Key</th><th>成本</th><th>调用</th><th>Tokens</th></tr></thead><tbody></tbody></table></section>
-  <section class="card"><h2>最近请求</h2><table id="requests"><thead><tr><th>端点</th><th>模型</th><th>Provider</th><th>状态</th><th>延迟</th></tr></thead><tbody></tbody></table></section>
+  <section class="card"><h2>成本</h2><div id="cost-total" class="muted"></div><table id="costs"><thead><tr><th>Key</th><th>成本</th><th>调用</th><th>Tokens</th></tr></thead><tbody></tbody></table><div id="cost-client-total" class="muted" style="margin-top:8px"></div><table id="costs-client"><thead><tr><th>客户端</th><th>成本</th><th>调用</th><th>Tokens</th></tr></thead><tbody></tbody></table></section>
+  <section class="card"><h2>客户端配额</h2><div id="alerting" class="muted"></div><div id="quota-note" class="muted"></div><table id="clients"><thead><tr><th>客户端</th><th>模型白名单</th><th>RPM</th><th>日配额</th><th>月调用</th><th>月预算</th></tr></thead><tbody></tbody></table></section>
+  <section class="card"><h2>最近请求</h2><div class="toolbar" style="margin-bottom:8px"><input id="f-client" placeholder="按客户端过滤" style="width:120px"><input id="f-model" placeholder="按模型过滤" style="width:130px"><select id="f-status" style="background:#0a0c0f;border:1px solid var(--border);color:var(--fg);border-radius:6px;padding:5px 8px;font-size:13px"><option value="">全部状态</option><option value="ok">ok</option><option value="error">error</option></select><button onclick="refresh()">筛选</button></div><table id="requests"><thead><tr><th>端点</th><th>模型</th><th>Provider</th><th>客户端</th><th>状态</th><th>延迟</th></tr></thead><tbody></tbody></table></section>
   <section class="card" style="grid-column:1/-1">
     <h2>⚙️ 配置 · 在线修改（存 SQLite，不改 config.yaml；保存即热重载）</h2>
     <table id="cfg-providers"><thead><tr><th style="width:130px">Provider</th><th>Base URL</th><th>API Key（留空 = 不改）</th><th style="width:45px">Key</th></tr></thead><tbody></tbody></table>
@@ -115,11 +116,32 @@ async function refresh(){
     for(const c of (costs.by_key||[])){
       cst.insertAdjacentHTML('beforeend','<tr><td>'+esc(c.key)+'</td><td>'+esc(c.cost)+'</td><td>'+esc(c.calls)+'</td><td>'+esc(c.prompt_tokens+c.completion_tokens)+'</td></tr>');
     }
+    const cct=document.querySelector('#costs-client tbody');if(cct){cct.innerHTML='';
+    for(const c of (costs.by_client||[])){
+      cct.insertAdjacentHTML('beforeend','<tr><td>'+esc(c.client||'(匿名)')+'</td><td>'+esc(c.cost)+'</td><td>'+esc(c.calls)+'</td><td>'+esc(c.prompt_tokens+c.completion_tokens)+'</td></tr>');
+    }}
+    const cl=document.querySelector('#clients tbody');if(cl){cl.innerHTML='';
+    for(const [name,c] of Object.entries(prov.clients||{})){
+      const u=c.usage||{};
+      const dq=u.daily_calls?('<br><span class="muted">'+esc(u.daily_calls.used)+'/'+esc(u.daily_calls.limit)+'</span>'):'';
+      const mq=u.monthly_calls?('<br><span class="muted">'+esc(u.monthly_calls.used)+'/'+esc(u.monthly_calls.limit)+'</span>'):'';
+      const mb=u.monthly_budget?('<br><span class="muted">'+esc(u.monthly_budget.used)+'/'+esc(u.monthly_budget.limit)+'</span>'):'';
+      cl.insertAdjacentHTML('beforeend','<tr><td>'+esc(name)+'</td><td class="muted">'+esc((c.models||[]).join(', ')||'全部')+'</td><td>'+esc(c.rpm||'—')+'</td><td>'+esc(c.daily_calls||'—')+dq+'</td><td>'+esc(c.monthly_calls||'—')+mq+'</td><td>'+esc(c.monthly_budget||'—')+mb+'</td></tr>');
+    }}
+    const al=document.getElementById('alerting');if(al){const a=prov.alerting||{};al.textContent='告警: '+(a.enabled?'已启用':'未配置 webhook')+'（去重中 '+esc(a.muted_events||0)+'，cooldown '+esc(a.cooldown_sec||'-')+'s）';}
+    const qn=document.getElementById('quota-note');if(qn){qn.textContent=prov.quota_persistent?'配额持久化: SQLite（重启不丢失）':('⚠️ '+esc(prov.quota_note||'未配置 db_path，仅 RPM/白名单生效'));qn.style.color=prov.quota_persistent?'var(--muted)':'var(--yellow)';}
     let reqs=[];
-    try{reqs=await getJSON('/v1/requests?limit=10');}catch(e){}
+    const fc=(document.getElementById('f-client')||{}).value||'';
+    const fm=(document.getElementById('f-model')||{}).value||'';
+    const fs=(document.getElementById('f-status')||{}).value||'';
+    let rq='/v1/requests?limit=10';
+    if(fc){rq+='&client='+encodeURIComponent(fc.trim());}
+    if(fm){rq+='&model='+encodeURIComponent(fm.trim());}
+    if(fs){rq+='&status='+encodeURIComponent(fs);}
+    try{reqs=await getJSON(rq);}catch(e){}
     const rt=document.querySelector('#requests tbody');rt.innerHTML='';
     for(const r of reqs){
-      rt.insertAdjacentHTML('beforeend','<tr><td>'+esc(r.endpoint)+'</td><td>'+esc(r.model)+'</td><td>'+esc(r.provider||'')+'</td><td>'+esc(r.status)+'</td><td>'+esc(r.latency_ms)+'ms</td></tr>');
+      rt.insertAdjacentHTML('beforeend','<tr><td>'+esc(r.endpoint)+'</td><td>'+esc(r.model)+'</td><td>'+esc(r.provider||'')+'</td><td>'+esc(r.client||'')+'</td><td>'+esc(r.status)+'</td><td>'+esc(r.latency_ms)+'ms</td></tr>');
     }
     st.textContent='已连接 '+new Date().toLocaleTimeString();
     st.className='ok';

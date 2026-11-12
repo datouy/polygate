@@ -89,4 +89,24 @@ def merge_config(base: dict, overrides: dict) -> dict:
                 by_name[m["name"]].update(m)
             else:
                 models.append(copy.deepcopy(m))
+
+    # 运营治理类配置也支持面板热改：虚拟 Key / 告警 / 健康 / 定价 / 开关。
+    # client_keys 为全量替换（增删改语义明确，避免合并残留已删除的 Key）。
+    ov_auth = overrides.get("auth")
+    if isinstance(ov_auth, dict):
+        auth = result.setdefault("auth", {})
+        for k, v in ov_auth.items():
+            auth[k] = copy.deepcopy(v)
+
+    for section in ("alerting", "health", "pricing", "redis"):
+        if section in overrides and isinstance(overrides[section], dict):
+            merged = result.setdefault(section, {})
+            if isinstance(merged, dict):
+                merged.update(copy.deepcopy(overrides[section]))
+            else:
+                result[section] = copy.deepcopy(overrides[section])
+
+    for flag in ("stream_include_usage", "log_retention_days"):
+        if flag in overrides:
+            result[flag] = copy.deepcopy(overrides[flag])
     return result

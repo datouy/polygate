@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -13,9 +13,9 @@ class ChatRequest(BaseModel):
     model: str
     messages: list[dict] = Field(default_factory=list)
     stream: bool = False
-    temperature: Optional[float] = None
-    max_tokens: Optional[int] = None
-    top_p: Optional[float] = None
+    temperature: float | None = None
+    max_tokens: int | None = None
+    top_p: float | None = None
     stop: Any = None
     tools: Any = None
     tool_choice: Any = None

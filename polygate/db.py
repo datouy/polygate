@@ -11,7 +11,7 @@ from __future__ import annotations
 import queue
 import sqlite3
 import threading
-from typing import Iterable
+from collections.abc import Iterable
 
 _SENTINEL = object()
 _MAX_QUEUE = 100_000  # 写入队列上限：超过后丢弃写入，避免磁盘异常时内存无界增长
@@ -62,7 +62,8 @@ class BatchWriter:
 
     def enqueue(self, sql: str, params: tuple = ()) -> None:
         if self._queue.qsize() >= _MAX_QUEUE:
-            self._dropped += 1
+            with self._lock:
+                self._dropped += 1
             return
         self._queue.put((sql, params))
 

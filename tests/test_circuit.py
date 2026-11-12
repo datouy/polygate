@@ -49,14 +49,34 @@ def test_probe_does_not_reset_business_failures():
     assert c.state == "open"
 
 
-def test_probe_only_recovers_half_open():
+def test_probe_recovers_open_circuit():
+    """主动健康探测成功应能把 open 状态的熔断器闭合。
+
+    否则会形成死锁：熔断 → 业务请求全部跳过该 Provider → 没有探测流量 →
+    永远不恢复，上游即使已恢复也只能靠重启网关。
+    """
     c = CircuitBreaker(failure_threshold=1, cooldown_sec=0.03)
     c.record_failure()          # open
     assert c.state == "open"
-    c.record_probe(True)        # open 状态下探测成功不直接关闭
-    assert c.state == "open"
+    c.record_probe(True)        # 探测成功 → 直接闭合
+    assert c.state == "closed"
+    assert c.snapshot()["consecutive_failures"] == 0
+
+
+def test_probe_recovers_half_open():
+    c = CircuitBreaker(failure_threshold=1, cooldown_sec=0.03)
+    c.record_failure()          # open
     time.sleep(0.04)
     c.allow()                   # half_open
     c.record_probe(True)        # half_open 下探测成功恢复
     assert c.state == "closed"
     assert c.snapshot()["consecutive_failures"] == 0
+
+
+def test_probe_failure_keeps_open():
+    """探测失败不应把熔断器误关。"""
+    c = CircuitBreaker(failure_threshold=1, cooldown_sec=0.03)
+    c.record_failure()
+    assert c.state == "open"
+    c.record_probe(False)
+    assert c.state == "open"
