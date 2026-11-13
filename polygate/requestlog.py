@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS requests (
 );
 CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts);
 CREATE INDEX IF NOT EXISTS idx_requests_client_ts ON requests(client, ts);
+CREATE INDEX IF NOT EXISTS idx_requests_client_logical ON requests(client, logical_id);
 """
 
 _MAX_RESPONSE = 20_000
@@ -167,6 +168,7 @@ class RequestLog:
                 self._conn.execute("ALTER TABLE requests ADD COLUMN client TEXT NOT NULL DEFAULT ''")
             try:
                 self._conn.execute("CREATE INDEX IF NOT EXISTS idx_requests_client_ts ON requests(client, ts)")
+                self._conn.execute("CREATE INDEX IF NOT EXISTS idx_requests_client_logical ON requests(client, logical_id)")
             except Exception:
                 pass
             self._conn.commit()
