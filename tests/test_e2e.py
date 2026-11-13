@@ -152,6 +152,9 @@ def test_e2e(tmp_path):
             assert r.status_code == 200
             assert "polygate_up 1" in r.text
             assert "polygate_requests_total" in r.text
+            assert "polygate_sqlite_writes_total" in r.text
+            assert "polygate_sqlite_failed_writes_total" in r.text
+            assert "polygate_sqlite_flush_timeouts_total" in r.text
 
             # 成本记账
             costs = c.get("/v1/costs").json()

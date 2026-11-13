@@ -123,3 +123,38 @@ def test_extract_stream_usage():
     usage = _extract_stream_usage(b"data: [DONE]", usage)
     usage = _extract_stream_usage(b"", usage)
     assert usage["completion_tokens"] == 3
+
+
+def test_limits_parsing_and_validation():
+    from polygate.runtime import RuntimeState
+
+    st = RuntimeState(
+        {
+            "providers": {},
+            "models": [],
+            "limits": {"total_timeout": 60, "max_attempts": 3, "retry_backoff": 0.5},
+        }
+    )
+    assert st.total_timeout == 60.0
+    assert st.max_attempts == 3
+    assert st.retry_backoff == 0.5
+
+    with pytest.raises(ValueError):
+        RuntimeState(
+            {
+                "providers": {},
+                "models": [],
+                "limits": {"total_timeout": 0, "max_attempts": 1, "retry_backoff": 0.0},
+            }
+        )
+
+
+def test_retry_after_seconds():
+    from polygate.server import _retry_after_seconds
+
+    assert _retry_after_seconds("2") == 2.0
+    assert _retry_after_seconds("0") == 0.0
+    assert _retry_after_seconds("") is None
+    assert _retry_after_seconds(None) is None
+    assert _retry_after_seconds("abc") is None
+    assert _retry_after_seconds("60") == 5.0  # 封顶 5 秒

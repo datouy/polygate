@@ -78,6 +78,37 @@ def test_quota_daily_monthly_budget(tmp_path):
     cost.close()
 
 
+def test_quota_reserve_and_settle_use_in_memory_counters(tmp_path):
+    """预留（reserve）先占一次调用额度，结算（settle）累计成本，避免每次请求扫全表。"""
+    rl = RequestLog(str(tmp_path / "r.db"))
+    cost = CostTracker(str(tmp_path / "c.db"))
+    checker = QuotaChecker(store=rl, cost=cost)
+    pol = ClientPolicy(name="a", daily_calls=1, monthly_calls=100, monthly_budget=1.0)
+
+    # 第一次预留通过并占用日配额
+    assert checker.reserve(pol, "a") is None
+    # 第二次预留命中日配额
+    assert "daily" in (checker.reserve(pol, "a") or "")
+
+    # 成本结算累计到预算：0.6 + 0.5 = 1.1 > 1.0
+    checker.settle_cost("a", 0.6)
+    checker.settle_cost("a", 0.5)
+    pol2 = ClientPolicy(name="a", daily_calls=100, monthly_budget=1.0)
+    assert "budget" in (checker.reserve(pol2, "a") or "")
+
+    # usage() 读的是同一份内存计数，不再触发全表聚合
+    u = checker.usage(pol2, "a")
+    assert u["daily_calls"]["used"] == 1
+    assert abs(u["monthly_budget"]["used"] - 1.1) < 1e-9
+
+    checker.reset_cached_usage()
+    # 清缓存后重新从 SQLite 恢复；请求日志/成本表里其实没有对应记录，故回到 0
+    fresh = checker.usage(pol2, "a")
+    assert fresh["daily_calls"]["used"] == 0
+    rl.close()
+    cost.close()
+
+
 def test_quota_without_store_is_not_blocking():
     checker = QuotaChecker(store=None, cost=None)
     pol = ClientPolicy(name="a", daily_calls=1, monthly_calls=1, monthly_budget=1.0)
