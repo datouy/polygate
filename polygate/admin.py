@@ -84,6 +84,8 @@ function H(){return {'Authorization':'Bearer '+k()};}
 async function getJSON(path){const r=await fetch(path,{headers:H()});if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}
 function pill(s){const c=s==='closed'?'ok':(s==='open'?'err':'warn');return '<span class="pill '+c+'">'+esc(s)+'</span>';}
 async function refresh(){
+  if(refresh._busy){return;}
+  refresh._busy=true;
   const st=document.getElementById('status');
   try{
     const prov=await getJSON('/v1/status');
@@ -104,13 +106,19 @@ async function refresh(){
       ut.insertAdjacentHTML('beforeend','<tr><td>'+esc(m)+'</td><td>'+esc(u.calls)+'</td><td>'+esc(u.errors)+'</td><td>'+esc(u.total_tokens)+'</td><td>'+esc(u.avg_latency_ms)+'ms</td></tr>');
     }
     let hist=[];
-    try{hist=await getJSON('/v1/usage/history?days=7');}catch(e){}
+    if(!refresh._slow || Date.now()-refresh._slow>=30000){
+      refresh._slow=Date.now();
+      try{hist=await getJSON('/v1/usage/history?days=7');}catch(e){}
+    }
     const ht=document.querySelector('#history tbody');ht.innerHTML='';
     for(const h of hist){
       ht.insertAdjacentHTML('beforeend','<tr><td>'+esc(h.day)+'</td><td>'+esc(h.calls)+'</td><td>'+esc(h.errors)+'</td><td>'+esc(h.prompt_tokens+h.completion_tokens)+'</td></tr>');
     }
     let costs=[];
-    try{costs=await getJSON('/v1/costs');}catch(e){}
+    if(refresh._costsAt===undefined || Date.now()-refresh._costsAt>=30000){
+      refresh._costsAt=Date.now();
+      try{costs=await getJSON('/v1/costs');}catch(e){}
+    }
     document.getElementById('cost-total').textContent='总成本: '+costs.total;
     const cst=document.querySelector('#costs tbody');cst.innerHTML='';
     for(const c of (costs.by_key||[])){
@@ -146,6 +154,7 @@ async function refresh(){
     st.textContent='已连接 '+new Date().toLocaleTimeString();
     st.className='ok';
   }catch(e){st.textContent='连接失败: '+e.message;st.className='err';}
+  finally{refresh._busy=false;}
 }
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];});}
 let PRESETS={};
@@ -213,7 +222,11 @@ async function addProvider(){
 }
 refresh();
 loadConfig();
-setInterval(refresh,5000);
+refresh._timer=setInterval(refresh,5000);
+document.addEventListener('visibilitychange',function(){
+  if(document.hidden && refresh._timer){clearInterval(refresh._timer);refresh._timer=null;}
+  else if(!document.hidden && !refresh._timer){refresh._timer=setInterval(refresh,5000);}
+});
 </script>
 </body>
 </html>

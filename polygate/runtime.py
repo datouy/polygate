@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from .alerts import Alerter
 from .circuit import CircuitBreaker, KeyBreaker
 from .clients import parse_client_keys
@@ -74,49 +76,76 @@ def mask_key(key: str) -> str:
 
 
 class RuntimeState:
-    """网关运行时状态。reload() 会就地更新，所有处理函数实时读到新值。"""
+    """原子发布完整配置快照；单个请求不会混用两个配置版本。"""
+
+    @dataclass(frozen=True)
+    class Snapshot:
+        providers: dict
+        models: dict
+        model_kinds: dict
+        rate_limits: dict
+        pricing: dict
+        router: Router
+        health_enabled: bool
+        health_interval: float
+        circuits: dict
+        key_breakers: dict
+        gateway_key: str | None
+        admin_key: str | None
+        client_keys: dict
+        client_headers: dict
+        alerter: Alerter | None
+        limiter: object
+        stream_include_usage: bool
+        log_retention_days: float
+        total_timeout: float
+        max_attempts: int
+        retry_backoff: float
 
     def __init__(self, cfg: dict):
-        self.circuits: dict[str, CircuitBreaker] = {}
-        self.key_breakers: dict[str, dict[str, KeyBreaker]] = {}
-        self.limiter = None
         self._redis_cfg_signature: object = object()
-        self.client_keys: dict = {}
-        self.alerter: Alerter | None = None
         self.reload(cfg)
 
+    def __getattr__(self, name):
+        # Reads outside a request (health loop, admin) always use one snapshot.
+        if name.startswith("_") or name in {"current", "reload", "editable"}:
+            raise AttributeError(name)
+        return getattr(self.current, name)
+
     def reload(self, cfg: dict) -> None:
-        self.cfg = cfg
-        (self.providers, self.models, self.model_kinds,
-         self.rate_limits, self.pricing) = build(cfg)
-        self.router = Router(self.providers, self.models)
+        previous = getattr(self, "current", None)
+        old_circuits = previous.circuits if previous else {}
+        old_key_breakers = previous.key_breakers if previous else {}
+        old_limiter = previous.limiter if previous else None
+        old_alerter = previous.alerter if previous else None
+        (providers, models, model_kinds, rate_limits, pricing) = build(cfg)
+        router = Router(providers, models)
 
         health_cfg = cfg.get("health") or {}
-        self.health_enabled = bool(health_cfg.get("enabled", True))
-        self.health_interval = float(health_cfg.get("interval", 30.0))
+        health_enabled = bool(health_cfg.get("enabled", True))
+        health_interval = float(health_cfg.get("interval", 30.0))
         threshold = int(health_cfg.get("failure_threshold", 3))
         cooldown = float(health_cfg.get("cooldown", 60.0))
 
         # 保留已有熔断器实例，仅更新参数；新增 Provider 才新建，移除的随之丢弃。
         # 否则每次保存配置都会把失败计数归零，熔断器在生产中形同虚设。
         circuits: dict[str, CircuitBreaker] = {}
-        for name in self.providers:
-            cb = self.circuits.get(name)
+        for name in providers:
+            cb = old_circuits.get(name)
             if cb is None:
                 cb = CircuitBreaker(failure_threshold=threshold, cooldown_sec=cooldown)
             else:
                 cb.failure_threshold = threshold
                 cb.cooldown_sec = cooldown
             circuits[name] = cb
-        self.circuits = circuits
 
         # Key 级熔断器：认证失效（401/403）的 Key 短期内不再使用。
         # 保留已有实例，仅新增/移除 Key，避免每次热重载把失败计数归零。
         key_threshold = int(health_cfg.get("key_failure_threshold", 2))
         key_cooldown = float(health_cfg.get("key_cooldown", 300.0))
         key_breakers: dict[str, dict[str, KeyBreaker]] = {}
-        for name, prov in self.providers.items():
-            existing = self.key_breakers.get(name, {})
+        for name, prov in providers.items():
+            existing = old_key_breakers.get(name, {})
             per_provider: dict[str, KeyBreaker] = {}
             for key in prov.api_keys:
                 kb = existing.get(key)
@@ -127,38 +156,60 @@ class RuntimeState:
                     kb.cooldown_sec = key_cooldown
                 per_provider[key] = kb
             key_breakers[name] = per_provider
-        self.key_breakers = key_breakers
-
         auth = cfg.get("auth") or {}
-        self.gateway_key = auth.get("api_key") or None
-        self.admin_key = auth.get("admin_key") or self.gateway_key
-        self.client_keys = parse_client_keys(auth)
+        gateway_key = auth.get("api_key") or None
+        admin_key = auth.get("admin_key") or gateway_key
+        client_keys = parse_client_keys(auth)
+        client_headers = {f"Bearer {key}": pol for key, pol in client_keys.items()}
 
         # 告警：仅在 webhook 变化时重建，避免热重载重复创建/丢连接。
         alert_cfg = cfg.get("alerting") or {}
         webhook = str(alert_cfg.get("webhook_url") or "").strip()
         if webhook:
-            if self.alerter is None or self.alerter.webhook_url != webhook:
-                self.alerter = Alerter(
+            if old_alerter is None or old_alerter.webhook_url != webhook:
+                alerter = Alerter(
                     webhook,
                     cooldown=float(alert_cfg.get("cooldown", 300.0)),
                     timeout=float(alert_cfg.get("timeout", 5.0)),
                 )
+            else:
+                alerter = old_alerter
         else:
-            self.alerter = None
+            alerter = None
 
         # 仅当 Redis URL 变化时才重建限流器，避免每次热重载泄漏一个 Redis 连接池。
         redis_cfg = cfg.get("redis")
         sig = (redis_cfg or {}).get("url") if isinstance(redis_cfg, dict) else None
-        if self.limiter is None or sig != self._redis_cfg_signature:
+        limiter = old_limiter
+        if limiter is None or sig != self._redis_cfg_signature:
             self._redis_cfg_signature = sig
-            self.limiter = build_limiter(redis_cfg)
+            limiter = build_limiter(redis_cfg)
+            if old_limiter is not None and hasattr(old_limiter, "close"):
+                old_limiter.close()
 
         # stream_options.include_usage 自动注入开关（部分国产厂商不兼容，可关）。
-        self.stream_include_usage = bool(cfg.get("stream_include_usage", True))
+        stream_include_usage = bool(cfg.get("stream_include_usage", True))
 
         # 日志保留天数（0 = 永久保留）。>0 时会定期清理 calls/requests/costs 中过旧数据。
-        self.log_retention_days = float(cfg.get("log_retention_days", 0) or 0)
+        log_retention_days = float(cfg.get("log_retention_days", 0) or 0)
+        limits = cfg.get("limits") or {}
+        total_timeout = float(limits.get("total_timeout", 180.0))
+        max_attempts = int(limits.get("max_attempts", 8))
+        retry_backoff = float(limits.get("retry_backoff", 0.15))
+        if total_timeout <= 0 or max_attempts <= 0 or retry_backoff < 0:
+            raise ValueError("limits.total_timeout/max_attempts must be positive; retry_backoff >= 0")
+        # Publishing this single reference is the only mutation visible to
+        # requests.  A failed build above leaves the previous snapshot intact.
+        self.current = self.Snapshot(
+            providers=providers, models=models, model_kinds=model_kinds,
+            rate_limits=rate_limits, pricing=pricing, router=router,
+            health_enabled=health_enabled, health_interval=health_interval,
+            circuits=circuits, key_breakers=key_breakers, gateway_key=gateway_key,
+            admin_key=admin_key, client_keys=client_keys, client_headers=client_headers,
+            alerter=alerter, limiter=limiter, stream_include_usage=stream_include_usage,
+            log_retention_days=log_retention_days, total_timeout=total_timeout,
+            max_attempts=max_attempts, retry_backoff=retry_backoff,
+        )
 
     def editable(self) -> dict:
         """给管理面板用的可编辑视图（Key 已脱敏，绝不返回明文）。"""

@@ -32,7 +32,11 @@ class RedisRateLimiter:
     def __init__(self, url: str):
         import redis  # 延迟导入，未安装 redis 包时不影响其它功能
 
-        self._redis = redis.Redis.from_url(url, decode_responses=False, protocol=2)
+        self._redis = redis.Redis.from_url(
+            url, decode_responses=False, protocol=2,
+            socket_connect_timeout=1.0, socket_timeout=1.0,
+            health_check_interval=30,
+        )
         self._script = self._redis.register_script(_TOKEN_BUCKET_SCRIPT)
 
     def allow(self, key: str, rate: float, burst: float) -> bool:
@@ -42,3 +46,6 @@ class RedisRateLimiter:
         except Exception:
             # Redis 故障时降级放行，保证网关可用性优先
             return True
+
+    def close(self) -> None:
+        self._redis.close()

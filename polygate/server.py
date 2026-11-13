@@ -18,6 +18,7 @@ import asyncio
 import hmac
 import json
 import os
+import random
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -65,6 +66,31 @@ _PASSTHROUGH_HEADERS = (
 
 # 请求体大小上限（字节）。默认 10MB，防止单个超大请求打爆内存/日志库。
 MAX_REQUEST_BYTES = int(os.environ.get("POLYGATE_MAX_REQUEST_BYTES", 10 * 1024 * 1024))
+MAX_AUDIO_BYTES = int(os.environ.get("POLYGATE_MAX_AUDIO_BYTES", 25 * 1024 * 1024))
+MAX_ERROR_BYTES = 64 * 1024
+MAX_SSE_EVENT_BYTES = 1024 * 1024
+
+
+class RequestTooLarge(Exception):
+    pass
+
+
+async def _bounded_error_bytes(resp: httpx.Response) -> bytes:
+    out = bytearray()
+    async for chunk in resp.aiter_bytes():
+        out.extend(chunk[: MAX_ERROR_BYTES - len(out)])
+        if len(out) >= MAX_ERROR_BYTES:
+            break
+    return bytes(out)
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return min(5.0, max(0.0, float(value)))
+    except (TypeError, ValueError):
+        return None
 
 
 
@@ -205,6 +231,8 @@ def create_app(config: str | dict | None = None) -> FastAPI:
             c = compute_cost(prompt, completion, state.pricing, model)
             if c > 0:
                 cost.add(key_label, model, prompt, completion, c, client=client or "")
+                if quota is not None and client:
+                    quota.settle_cost(client, c)
         metrics.inc("polygate_requests_total", {"model": model, "provider": provider, "status": status})
         if status == "error":
             metrics.inc("polygate_errors_total", {"model": model})
@@ -337,14 +365,29 @@ def create_app(config: str | dict | None = None) -> FastAPI:
         req_id = uuid.uuid4().hex
         request.state.polygate_req_id = req_id
 
+        body_limit = MAX_AUDIO_BYTES if request.url.path == "/v1/audio/transcriptions" else MAX_REQUEST_BYTES
+        received = 0
+        original_receive = request.receive
+
+        async def bounded_receive():
+            nonlocal received
+            message = await original_receive()
+            if message.get("type") == "http.request":
+                received += len(message.get("body", b""))
+                if received > body_limit:
+                    raise RequestTooLarge()
+            return message
+
+        request._receive = bounded_receive
+
         content_length = request.headers.get("content-length")
         if content_length:
             try:
-                if int(content_length) > MAX_REQUEST_BYTES:
+                if int(content_length) > body_limit:
                     return Response(
                         content=json.dumps(
                             _error_body(
-                                f"request body too large (limit {MAX_REQUEST_BYTES} bytes)",
+                                f"request body too large (limit {body_limit} bytes)",
                                 "invalid_request_error",
                                 "request_too_large",
                             ),
@@ -357,7 +400,16 @@ def create_app(config: str | dict | None = None) -> FastAPI:
             except ValueError:
                 pass
 
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
+        except RequestTooLarge:
+            return Response(
+                content=json.dumps(_error_body(
+                    f"request body too large (limit {body_limit} bytes)",
+                    "invalid_request_error", "request_too_large",
+                ), ensure_ascii=False),
+                status_code=413, media_type="application/json", headers={"X-Request-ID": req_id},
+            )
         response.headers.setdefault("X-Request-ID", req_id)
         return response
 
@@ -395,13 +447,16 @@ def create_app(config: str | dict | None = None) -> FastAPI:
         )
 
     # ---------- 鉴权与客户端治理 ----------
-    def _resolve_client(request: Request) -> tuple[str, object | None]:
+    def _resolve_client(request: Request, snapshot=None) -> tuple[str, object | None]:
         """解析调用方：优先匹配虚拟 Key，其次主 Key，返回 (client 名, 配额策略)。"""
         auth_header = request.headers.get("authorization", "")
-        for key, pol in state.client_keys.items():
-            if hmac.compare_digest(auth_header, f"Bearer {key}"):
-                return pol.name or mask_key(key), pol
-        gw = state.gateway_key
+        snapshot = snapshot or state.current
+        pol = snapshot.client_headers.get(auth_header)
+        if pol is not None:
+            for key, candidate in snapshot.client_keys.items():
+                if candidate is pol:
+                    return pol.name or mask_key(key), pol
+        gw = snapshot.gateway_key
         if not gw:
             return "default", None
         if hmac.compare_digest(auth_header, f"Bearer {gw}"):
@@ -412,30 +467,30 @@ def create_app(config: str | dict | None = None) -> FastAPI:
         if state.alerter is not None:
             state.alerter.notify(event, event, message)
 
-    async def _enforce_client(client_name: str, policy, model: str) -> None:
+    async def _enforce_client(client_name: str, policy, model: str, snapshot=None) -> None:
         """执行虚拟 Key 的模型白名单 / RPM / 配额 / 预算检查；超限抛 GatewayError。"""
+        snapshot = snapshot or state.current
         if policy is None or quota is None:
             return
         reason = quota.check_model(policy, model)
         if reason:
             _alert("quota_exceeded", f"客户端 {client_name}: {reason}")
             raise GatewayError(403, reason, error_type="invalid_request_error")
-        if isinstance(state.limiter, RateLimiter):
-            reason = quota.check_rpm(policy, client_name)
+        limiter = snapshot.limiter
+        if isinstance(limiter, RateLimiter):
+            reason = quota.check_rpm(policy, client_name, limiter)
         else:
-            reason = await asyncio.to_thread(quota.check_rpm, policy, client_name)
+            reason = await asyncio.to_thread(quota.check_rpm, policy, client_name, limiter)
         if reason:
             _alert("quota_exceeded", f"客户端 {client_name}: {reason}")
             raise GatewayError(429, reason, error_type="rate_limit_error")
-        for checker in ("check_daily", "check_monthly_calls"):
-            reason = await asyncio.to_thread(getattr(quota, checker), policy, client_name)
-            if reason:
-                _alert("quota_exceeded", f"客户端 {client_name}: {reason}")
-                raise GatewayError(429, reason, error_type="rate_limit_error")
-        reason = await asyncio.to_thread(quota.check_budget, policy, client_name)
+        reason = await asyncio.to_thread(quota.reserve, policy, client_name)
         if reason:
             _alert("quota_exceeded", f"客户端 {client_name}: {reason}")
-            raise GatewayError(403, reason, error_type="insufficient_quota")
+            raise GatewayError(
+                403 if "budget" in reason else 429, reason,
+                error_type="insufficient_quota" if "budget" in reason else "rate_limit_error",
+            )
 
     def _record_circuit_failure(circuit, provider_name: str) -> None:
         """记录一次 Provider 熔断失败，并在熔断首次打开时告警。"""
@@ -533,7 +588,7 @@ def create_app(config: str | dict | None = None) -> FastAPI:
                 raise UpstreamError(None, str(exc)) from exc
 
         if resp.status_code >= 400:
-            raw = await resp.aread()
+            raw = await _bounded_error_bytes(resp)
             await resp.aclose()
             latency = (time.time() - start) * 1000
             _record_stats(model_name, cand.provider_name, "error", latency_ms=latency, key_label=key_label, client=client_name)
@@ -549,18 +604,38 @@ def create_app(config: str | dict | None = None) -> FastAPI:
         usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         stream_error = None
         buffer = b""
+        parse_error = None
 
         async def gen():
-            nonlocal usage, stream_error, buffer
+            nonlocal usage, stream_error, buffer, parse_error
             try:
                 async for chunk in resp.aiter_bytes():
-                    buffer += chunk
-                    while b"\n" in buffer:
-                        line, buffer = buffer.split(b"\n", 1)
-                        usage = _extract_stream_usage(line, usage)
+                    # Each chunk is split once; only the incomplete final line
+                    # is retained, rather than repeatedly copying the stream.
+                    start = 0
+                    while True:
+                        end = chunk.find(b"\n", start)
+                        if end < 0:
+                            buffer += chunk[start:]
+                            break
+                        line = buffer + chunk[start:end]
+                        buffer = b""
+                        if len(line) <= MAX_SSE_EVENT_BYTES:
+                            usage = _extract_stream_usage(line, usage)
+                        else:
+                            parse_error = "upstream SSE event exceeded size limit"
+                        start = end + 1
+                    if len(buffer) > MAX_SSE_EVENT_BYTES:
+                        parse_error = "upstream SSE event exceeded size limit"
+                        buffer = b""
                     yield chunk
                 if buffer:
                     usage = _extract_stream_usage(buffer, usage)
+                if parse_error and not stream_error:
+                    stream_error = parse_error
+            except (asyncio.CancelledError, GeneratorExit):
+                stream_error = "client disconnected"
+                raise
             except Exception as exc:
                 stream_error = str(exc)
                 err_payload = json.dumps(
@@ -633,7 +708,7 @@ def create_app(config: str | dict | None = None) -> FastAPI:
         headers_out["X-Request-ID"] = ctx["req_id"]
         return JSONResponse(data, headers=headers_out)
 
-    async def _try_all(cands: list[Candidate], model_name: str, fn):
+    async def _try_all(cands: list[Candidate], model_name: str, fn, snapshot=None):
         """依次尝试候选（Provider × Key），并在必要时故障切换。
 
         错误语义（对客户端友好）：
@@ -642,26 +717,31 @@ def create_app(config: str | dict | None = None) -> FastAPI:
         * 上游 429 属于 Key 维度问题：换下一个 Key；全部 Key 都 429 才回 429。
         * 连接错误 / 5xx 属于 Provider 维度问题：换下一个 Provider；全挂才回 502。
         """
+        snapshot = snapshot or state.current
+        deadline = time.monotonic() + snapshot.total_timeout
         last: UpstreamError | None = None
         last_client_error: UpstreamError | None = None
         attempted = False
         rate_limited = False
         circuit_open = False
-        for cand in cands:
-            circuit = state.circuits.get(cand.provider_name)
+        for attempt, cand in enumerate(cands[: snapshot.max_attempts]):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise GatewayError(504, f"total request timeout for model '{model_name}'", error_type="service_unavailable")
+            circuit = snapshot.circuits.get(cand.provider_name)
             if circuit is not None and not circuit.allow():
                 circuit_open = True
                 continue
             # Key 级熔断：认证失效的 Key 短期内不再使用，避免每次请求白付一次 401 RTT
-            key_breaker = state.key_breakers.get(cand.provider_name, {}).get(cand.api_key)
+            key_breaker = snapshot.key_breakers.get(cand.provider_name, {}).get(cand.api_key)
             if key_breaker is not None and not key_breaker.allow():
                 continue
-            rl = state.rate_limits.get(cand.provider_name)
+            rl = snapshot.rate_limits.get(cand.provider_name)
             if rl:
                 # 限流维度修正：按 Provider 计量（不是 provider:key），
                 # 否则配 3 个 Key 会把有效限流放大 3 倍。
                 rl_key = f"{cand.provider_name}"
-                limiter = state.limiter
+                limiter = snapshot.limiter
                 if isinstance(limiter, RateLimiter):
                     # 内存令牌桶是纯 CPU + 线程锁，直接调用；只有 Redis 这种阻塞 IO 才丢线程
                     ok = limiter.allow(rl_key, rl[0], rl[1])
@@ -672,12 +752,18 @@ def create_app(config: str | dict | None = None) -> FastAPI:
                     continue
             attempted = True
             try:
-                result = await fn(cand)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise GatewayError(504, f"total request timeout for model '{model_name}'", error_type="service_unavailable")
+                result = await asyncio.wait_for(fn(cand), timeout=remaining)
                 if circuit is not None:
                     circuit.record_success()
                 if key_breaker is not None:
                     key_breaker.record_success()
                 return result
+            except TimeoutError as exc:
+                last = UpstreamError(None, "total request deadline exceeded")
+                raise GatewayError(504, last.message, error_type="service_unavailable") from exc
             except UpstreamError as exc:
                 last = exc
                 if is_rate_limited(exc.status):
@@ -687,6 +773,11 @@ def create_app(config: str | dict | None = None) -> FastAPI:
                         key_breaker.record_failure()
                     if circuit is not None:
                         _record_circuit_failure(circuit, cand.provider_name)
+                    delay = _retry_after_seconds(exc.headers.get("retry-after"))
+                    if delay is None:
+                        delay = min(2.0, snapshot.retry_backoff * (2 ** min(attempt, 4)))
+                    if delay > 0 and time.monotonic() + delay < deadline:
+                        await asyncio.sleep(delay * random.uniform(0.5, 1.0))
                     continue
                 if is_client_error(exc.status):
                     # 400/404/422：请求本身有问题 → 立刻中断，原样回传。
@@ -697,6 +788,8 @@ def create_app(config: str | dict | None = None) -> FastAPI:
                     # 401/403：Key 维度问题 → 标记该 Key 并换下一个 Key
                     if key_breaker is not None:
                         key_breaker.record_failure()
+                    if snapshot.retry_backoff and time.monotonic() + snapshot.retry_backoff < deadline:
+                        await asyncio.sleep(snapshot.retry_backoff * random.uniform(0.5, 1.0))
                     continue
                 if is_retryable(exc.status):
                     # 连接错误/5xx：Provider 维度问题 → 记录熔断失败并换下一个 Provider
@@ -747,12 +840,13 @@ def create_app(config: str | dict | None = None) -> FastAPI:
         raise GatewayError(502, detail, error_type="api_error")
 
 
-    async def _handle_chat(body: ChatRequest, client_name: str = ""):
-        cands = state.router.candidates(body.model)
+    async def _handle_chat(body: ChatRequest, client_name: str = "", snapshot=None):
+        snapshot = snapshot or state.current
+        cands = snapshot.router.candidates(body.model)
         if not cands:
             raise HTTPException(status_code=404, detail=f"unknown model: {body.model}")
         public_payload = body.model_dump(exclude_none=True)
-        if body.stream and state.stream_include_usage:
+        if body.stream and snapshot.stream_include_usage:
             public_payload.setdefault("stream_options", {"include_usage": True})
         logical_id = uuid.uuid4().hex
         ctx = {"endpoint": "/v1/chat/completions", "client": client_name, "logical_id": logical_id}
@@ -765,15 +859,16 @@ def create_app(config: str | dict | None = None) -> FastAPI:
             return await _forward_nonstream(cand, upstream_payload, body.model, cand.provider.chat_url, ctx, log_request=public_payload)
 
         try:
-            result = await _try_all(cands, body.model, fn)
+            result = await _try_all(cands, body.model, fn, snapshot)
             stats.record_request(body.model, "ok", client_name)
             return result
         except Exception:
             stats.record_request(body.model, "error", client_name)
             raise
 
-    async def _handle_embeddings(body: EmbeddingsRequest, client_name: str = ""):
-        cands = state.router.candidates(body.model)
+    async def _handle_embeddings(body: EmbeddingsRequest, client_name: str = "", snapshot=None):
+        snapshot = snapshot or state.current
+        cands = snapshot.router.candidates(body.model)
         if not cands:
             raise HTTPException(status_code=404, detail=f"unknown embedding model: {body.model}")
         public_payload = body.model_dump(exclude_none=True)
@@ -785,7 +880,7 @@ def create_app(config: str | dict | None = None) -> FastAPI:
             return await _forward_nonstream(cand, upstream_payload, body.model, cand.provider.embeddings_url, ctx, log_request=public_payload)
 
         try:
-            result = await _try_all(cands, body.model, fn)
+            result = await _try_all(cands, body.model, fn, snapshot)
             stats.record_request(body.model, "ok", client_name)
             return result
         except Exception:
@@ -821,6 +916,15 @@ def create_app(config: str | dict | None = None) -> FastAPI:
     @app.get("/metrics")
     async def metrics_route():
         gauges = [("polygate_up", {}, 1.0)]
+        if writer is not None:
+            snapshot = writer.snapshot()
+            gauges.extend((
+                ("polygate_sqlite_queue_size", {}, float(snapshot["queued"])),
+                ("polygate_sqlite_writes_total", {}, float(snapshot["written"])),
+                ("polygate_sqlite_dropped_writes_total", {}, float(snapshot["dropped"])),
+                ("polygate_sqlite_failed_writes_total", {}, float(snapshot["failed"])),
+                ("polygate_sqlite_flush_timeouts_total", {}, float(snapshot["flush_timeouts"])),
+            ))
         for name, c in state.circuits.items():
             s = 0 if c.state == "closed" else (1 if c.state == "open" else 2)
             gauges.append(("polygate_provider_circuit_state", {"provider": name}, s))
@@ -831,12 +935,13 @@ def create_app(config: str | dict | None = None) -> FastAPI:
 
     @app.get("/v1/models")
     async def list_models(request: Request):
-        _resolve_client(request)
+        snapshot = state.current
+        _resolve_client(request, snapshot)
         # 只列出 chat 模型：embeddings / audio 模型不该出现在 OpenAI SDK 的模型列表里
         data = [
             {"id": name, "object": "model", "owned_by": routes[0].provider}
-            for name, routes in state.models.items()
-            if state.model_kinds.get(name, "chat") == "chat"
+            for name, routes in snapshot.models.items()
+            if snapshot.model_kinds.get(name, "chat") == "chat"
         ]
         return {"object": "list", "data": data}
 
@@ -891,25 +996,36 @@ def create_app(config: str | dict | None = None) -> FastAPI:
                 else:
                     ov_models.append(m)
 
+        try:
+            state.reload(merge_config(base_cfg, overrides))
+        except Exception:
+            # Do not persist a config that cannot build a complete runtime.
+            raise HTTPException(status_code=400, detail="invalid configuration: runtime build failed") from None
         config_store.save(overrides)
-        state.reload(merge_config(base_cfg, overrides))
         return {"ok": True, "changed": changed, "providers": list(state.providers.keys())}
 
     @app.delete("/v1/config")
     async def reset_config(request: Request):
         """清除所有 SQLite 覆盖，回到 config.yaml 的原始配置。"""
         _check_admin(request)
+        try:
+            state.reload(merge_config(base_cfg, {}))
+        except Exception:
+            raise HTTPException(status_code=500, detail="failed to build base configuration") from None
         config_store.save({})
-        state.reload(merge_config(base_cfg, {}))
         return {"ok": True, "providers": list(state.providers.keys())}
 
     @app.post("/v1/config/reload")
     async def reload_config(request: Request):
         nonlocal base_cfg
         _check_admin(request)
-        if config_path:
-            base_cfg = load_config(config_path)
-        state.reload(merge_config(base_cfg, config_store.load()))
+        new_cfg = load_config(config_path) if config_path else base_cfg
+        overrides = config_store.load()
+        try:
+            state.reload(merge_config(new_cfg, overrides))
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid configuration: runtime build failed") from None
+        base_cfg = new_cfg
         return {"ok": True, "providers": list(state.providers.keys())}
 
     # ---------- 状态与统计 ----------
@@ -1024,19 +1140,22 @@ def create_app(config: str | dict | None = None) -> FastAPI:
     # ---------- 推理接口 ----------
     @app.post("/v1/chat/completions")
     async def chat_completions(body: ChatRequest, request: Request):
-        client_name, policy = _resolve_client(request)
-        await _enforce_client(client_name, policy, body.model)
-        return await _handle_chat(body, client_name)
+        snapshot = state.current
+        client_name, policy = _resolve_client(request, snapshot)
+        await _enforce_client(client_name, policy, body.model, snapshot)
+        return await _handle_chat(body, client_name, snapshot)
 
     @app.post("/v1/embeddings")
     async def embeddings(body: EmbeddingsRequest, request: Request):
-        client_name, policy = _resolve_client(request)
-        await _enforce_client(client_name, policy, body.model)
-        return await _handle_embeddings(body, client_name)
+        snapshot = state.current
+        client_name, policy = _resolve_client(request, snapshot)
+        await _enforce_client(client_name, policy, body.model, snapshot)
+        return await _handle_embeddings(body, client_name, snapshot)
 
     @app.post("/v1/completions")
     async def completions(body: dict, request: Request):
-        client_name, policy = _resolve_client(request)
+        snapshot = state.current
+        client_name, policy = _resolve_client(request, snapshot)
         prompt = body.get("prompt")
         if isinstance(prompt, str):
             messages = [{"role": "user", "content": prompt}]
@@ -1047,12 +1166,13 @@ def create_app(config: str | dict | None = None) -> FastAPI:
         chat_body = {k: v for k, v in body.items() if k not in ("prompt",)}
         chat_body["messages"] = messages
         chat_req = ChatRequest(**chat_body)
-        await _enforce_client(client_name, policy, chat_req.model)
-        return await _handle_chat(chat_req, client_name)
+        await _enforce_client(client_name, policy, chat_req.model, snapshot)
+        return await _handle_chat(chat_req, client_name, snapshot)
 
     @app.post("/v1/audio/transcriptions")
     async def transcriptions(request: Request):
-        client_name, policy = _resolve_client(request)
+        snapshot = state.current
+        client_name, policy = _resolve_client(request, snapshot)
         form = await request.form()
         model = str(form.get("model") or "")
         file = form.get("file")
@@ -1061,14 +1181,14 @@ def create_app(config: str | dict | None = None) -> FastAPI:
         if not hasattr(file, "read"):
             raise HTTPException(status_code=400, detail="file must be an uploaded file")
 
-        await _enforce_client(client_name, policy, model)
+        await _enforce_client(client_name, policy, model, snapshot)
 
         content = await file.read()
         filename = getattr(file, "filename", None) or "audio.bin"
         content_type = getattr(file, "content_type", None) or "application/octet-stream"
         extra = {k: v for k, v in form.items() if k not in ("model", "file")}
 
-        cands = state.router.candidates(model)
+        cands = snapshot.router.candidates(model)
         if not cands:
             raise HTTPException(status_code=404, detail=f"unknown model: {model}")
 
@@ -1079,7 +1199,7 @@ def create_app(config: str | dict | None = None) -> FastAPI:
             return await _forward_transcription(cand, model, content, filename, content_type, extra, ctx)
 
         try:
-            result = await _try_all(cands, model, fn)
+            result = await _try_all(cands, model, fn, snapshot)
             stats.record_request(model, "ok", client_name)
             return result
         except Exception:

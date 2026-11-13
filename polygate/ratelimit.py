@@ -32,6 +32,15 @@ class RateLimiter:
 
     def allow(self, key: str, rate: float, burst: float) -> bool:
         with self._lock:
+            now = time.monotonic()
+            # Bound memory when many short-lived virtual keys/providers appear.
+            if len(self._buckets) >= 10_000:
+                stale = [k for k, b in self._buckets.items() if now - b.updated > 600]
+                for k in stale:
+                    del self._buckets[k]
+                if len(self._buckets) >= 10_000:
+                    oldest = min(self._buckets, key=lambda k: self._buckets[k].updated)
+                    del self._buckets[oldest]
             bucket = self._buckets.get(key)
             if bucket is None:
                 bucket = TokenBucket(rate, burst)
