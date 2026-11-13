@@ -42,6 +42,10 @@
 | 多 Key 轮询 · Key rotation | 同一 Provider 配多个 Key 自动轮换；401/403/429 自动换下一个 Key |
 | 权重负载均衡 · Weighted LB | 同一模型配多个 Provider，按 weight 加权随机 |
 | 故障自动切换 · Failover | 连接错误 / 5xx 换 Provider；400/404/422 请求本身问题不重试 |
+| 请求总超时/重试预算 · Request budget | 单次逻辑请求可设总超时、最大候选数与 429/401 退避，避免全挂时长期占用连接 |
+| 原子热重载 · Atomic hot reload | 配置先构建成不可变快照再一次性切换；构建失败保留旧配置、不写 SQLite |
+| 配额内存预占 · Quota reservation | 日/月配额与预算用进程内存计数 + 预留机制，请求热路径不再扫 SQLite |
+| 请求体大小限制 · Body limits | 普通请求 10MB / 音频 25MB，Content-Length 与 chunked/multipart 读取路径都拦截 |
 | 流式透传 · Streaming | SSE 原样转发，自动注入 `stream_options.include_usage`（可用 `stream_include_usage` 开关） |
 | Embeddings 转发 · Embeddings | `/v1/embeddings` 统一转发 |
 | 语音转写转发 · Transcription | `/v1/audio/transcriptions` 统一转发（multipart） |
@@ -86,6 +90,8 @@ POLYGATE_PORT=8000 POLYGATE_CONFIG=config.yaml python run.py
 > 💡 配置加载顺序：`POLYGATE_CONFIG` 环境变量 → `config.yaml`（存在则优先）→ `config.example.yaml`。
 > 也可以启动后打开 `http://127.0.0.1:8000/admin`，在面板里**在线改 URL / Key**（存 SQLite，不改 `config.yaml`，保存即生效）。
 
+> 🧱 请求体大小限制（防内存被打满）：POLYGATE_MAX_REQUEST_BYTES 默认 10MB（JSON 请求），POLYGATE_MAX_AUDIO_BYTES 默认 25MB（音频上传）。超限直接返回 413；限制按实际读取字节数校验，chunked 编码同样生效。
+
 ### 🐳 Docker
 
 ```bash
@@ -108,6 +114,10 @@ docker compose up -d --build
 db_path: polygate.db             # SQLite：用量持久化 + 配置覆盖（留空则禁用）· persistence & config overrides
 stream_include_usage: true       # 流式自动注入 include_usage 统计 token（部分厂商不兼容可关）· stream usage injection
 log_retention_days: 0            # 日志保留天数（0=永久）；>0 定期清理过旧记录，防止 SQLite 无限增长 · log retention
+limits:                          # 单次逻辑请求的容错预算 · per-request fault-tolerance budget
+  total_timeout: 180             # 整个请求（含故障切换重试）的总超时（秒）· total timeout (s)
+  max_attempts: 8                # 最多尝试的 Provider × Key 候选数 · max upstream attempts
+  retry_backoff: 0.15            # 重试基础退避（秒），带随机抖动，指数封顶 · retry backoff base (s)
 auth:
   api_key: "change-me"           # 网关入口密钥 · gateway key
   admin_key: ""                  # 管理端口密钥（留空复用 api_key）· admin key
