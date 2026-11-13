@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -99,6 +100,65 @@ class QuotaChecker:
         self._limiter = limiter
         self._store = store
         self._cost = cost
+        self._usage_lock = threading.Lock()
+        self._usage_cache: dict[str, dict] = {}
+
+    def _usage_for(self, client: str, refresh: bool = False) -> dict:
+        """Load persistent usage once per client/day/month, then use counters.
+
+        Reservations make concurrent requests in this process count before any
+        upstream call. Multiple workers still require a shared quota backend
+        for a globally exact limit; the HTTP status endpoint states this.
+        """
+        day = _day_start_ts()
+        month = _month_start_ts()
+        if not refresh:
+            with self._usage_lock:
+                cached = self._usage_cache.get(client)
+                if cached and cached["day"] == day and cached["month"] == month:
+                    return cached
+        loaded = {"day": day, "month": month, "daily": 0, "monthly": 0, "spent": 0.0}
+        if self._store is not None:
+            loaded["daily"] = self._store.count_requests(client=client, since=day)
+            loaded["monthly"] = self._store.count_requests(client=client, since=month)
+        if self._cost is not None:
+            loaded["spent"] = self._cost.spend_since(client=client, since=month)
+        with self._usage_lock:
+            if not refresh:
+                current = self._usage_cache.get(client)
+                if current and current["day"] == day and current["month"] == month:
+                    return current
+            self._usage_cache[client] = loaded
+            return loaded
+
+    def reserve(self, policy: ClientPolicy, client: str) -> str | None:
+        """Atomically reserve one logical request before checking its limits."""
+        if policy is None or (not policy.daily_calls and not policy.monthly_calls and not policy.monthly_budget):
+            return None
+        usage = self._usage_for(client)
+        with self._usage_lock:
+            if policy.daily_calls > 0 and usage["daily"] >= policy.daily_calls:
+                return f"client daily quota exceeded ({usage['daily']}/{policy.daily_calls})"
+            if policy.monthly_calls > 0 and usage["monthly"] >= policy.monthly_calls:
+                return f"client monthly quota exceeded ({usage['monthly']}/{policy.monthly_calls})"
+            if policy.monthly_budget > 0 and usage["spent"] >= policy.monthly_budget:
+                return f"client monthly budget exceeded ({usage['spent']:.4f}/{policy.monthly_budget:g})"
+            # Failed calls still consume a logical request quota, matching the
+            # pre-existing request-log based semantics.
+            usage["daily"] += 1
+            usage["monthly"] += 1
+        return None
+
+    def settle_cost(self, client: str, amount: float) -> None:
+        if not client or amount <= 0:
+            return
+        usage = self._usage_for(client)
+        with self._usage_lock:
+            usage["spent"] += amount
+
+    def reset_cached_usage(self) -> None:
+        with self._usage_lock:
+            self._usage_cache.clear()
 
     def check_model(self, policy: ClientPolicy, model: str) -> str | None:
         """模型白名单检查；返回 None 表示通过，否则返回拒绝原因。"""
@@ -106,12 +166,13 @@ class QuotaChecker:
             return f"model '{model}' not allowed for this client key"
         return None
 
-    def check_rpm(self, policy: ClientPolicy, client: str) -> str | None:
+    def check_rpm(self, policy: ClientPolicy, client: str, limiter=None) -> str | None:
         """RPM 检查（内存令牌桶）；返回 None 表示通过。"""
-        if not policy.rpm or policy.rpm <= 0 or self._limiter is None:
+        limiter = limiter if limiter is not None else self._limiter
+        if not policy.rpm or policy.rpm <= 0 or limiter is None:
             return None
         burst = policy.rpm_burst if policy.rpm_burst > 0 else policy.rpm
-        if not self._limiter.allow(f"client-rpm:{client}", policy.rpm / 60.0, burst):
+        if not limiter.allow(f"client-rpm:{client}", policy.rpm / 60.0, burst):
             return f"client rpm limit exceeded ({policy.rpm:g}/min)"
         return None
 
@@ -120,7 +181,7 @@ class QuotaChecker:
             return None
         if self._store is None:
             return None
-        used = self._store.count_requests(client=client, since=_day_start_ts())
+        used = self._usage_for(client, refresh=True)["daily"]
         if used >= policy.daily_calls:
             return f"client daily quota exceeded ({used}/{policy.daily_calls})"
         return None
@@ -130,7 +191,7 @@ class QuotaChecker:
             return None
         if self._store is None:
             return None
-        used = self._store.count_requests(client=client, since=_month_start_ts())
+        used = self._usage_for(client, refresh=True)["monthly"]
         if used >= policy.monthly_calls:
             return f"client monthly quota exceeded ({used}/{policy.monthly_calls})"
         return None
@@ -140,7 +201,7 @@ class QuotaChecker:
             return None
         if self._cost is None:
             return None
-        spent = self._cost.spend_since(client=client, since=_month_start_ts())
+        spent = self._usage_for(client, refresh=True)["spent"]
         if spent >= policy.monthly_budget:
             return f"client monthly budget exceeded ({spent:.4f}/{policy.monthly_budget:g})"
         return None
@@ -162,19 +223,20 @@ class QuotaChecker:
     def usage(self, policy: ClientPolicy, client: str) -> dict:
         """返回配额/预算的当前用量（供面板展示）；无持久化后端时返回空 dict。"""
         out: dict = {}
+        usage = self._usage_for(client)
         if self._store is not None and policy.daily_calls:
             out["daily_calls"] = {
-                "used": self._store.count_requests(client=client, since=_day_start_ts()),
+                "used": usage["daily"],
                 "limit": policy.daily_calls,
             }
         if self._store is not None and policy.monthly_calls:
             out["monthly_calls"] = {
-                "used": self._store.count_requests(client=client, since=_month_start_ts()),
+                "used": usage["monthly"],
                 "limit": policy.monthly_calls,
             }
         if self._cost is not None and policy.monthly_budget:
             out["monthly_budget"] = {
-                "used": round(self._cost.spend_since(client=client, since=_month_start_ts()), 6),
+                "used": round(usage["spent"], 6),
                 "limit": policy.monthly_budget,
             }
         return out
