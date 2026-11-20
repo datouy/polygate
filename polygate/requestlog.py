@@ -31,8 +31,6 @@ CREATE TABLE IF NOT EXISTS requests (
     truncated INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts);
-CREATE INDEX IF NOT EXISTS idx_requests_client_ts ON requests(client, ts);
-CREATE INDEX IF NOT EXISTS idx_requests_client_logical ON requests(client, logical_id);
 """
 
 _MAX_RESPONSE = 20_000
@@ -167,6 +165,10 @@ class RequestLog:
             if "client" not in cols:
                 self._conn.execute("ALTER TABLE requests ADD COLUMN client TEXT NOT NULL DEFAULT ''")
             try:
+                # Older databases predate client/logical_id.  Create these
+                # indexes only after migrations have added their columns;
+                # executing them in _SCHEMA would fail before _migrate runs.
+                self._conn.execute("CREATE INDEX IF NOT EXISTS idx_requests_logical_id ON requests(logical_id)")
                 self._conn.execute("CREATE INDEX IF NOT EXISTS idx_requests_client_ts ON requests(client, ts)")
                 self._conn.execute("CREATE INDEX IF NOT EXISTS idx_requests_client_logical ON requests(client, logical_id)")
             except Exception:
@@ -239,7 +241,8 @@ class RequestLog:
             where.append("ts >= ?")
             params.append(since)
         sql = (
-            "SELECT req_id,ts,endpoint,model,provider,key_label,client,status,status_code,latency_ms "
+            "SELECT req_id,logical_id,ts,endpoint,model,provider,key_label,client,status,status_code,latency_ms,"
+            "upstream_model "
             "FROM requests"
         )
         if where:
@@ -254,15 +257,17 @@ class RequestLog:
         return [
             {
                 "req_id": r[0],
-                "ts": r[1],
-                "endpoint": r[2],
-                "model": r[3],
-                "provider": r[4],
-                "key": r[5],
-                "client": r[6],
-                "status": r[7],
-                "status_code": r[8],
-                "latency_ms": r[9],
+                "logical_id": r[1],
+                "ts": r[2],
+                "endpoint": r[3],
+                "model": r[4],
+                "provider": r[5],
+                "key": r[6],
+                "client": r[7],
+                "status": r[8],
+                "status_code": r[9],
+                "latency_ms": r[10],
+                "upstream_model": r[11],
             }
             for r in rows
         ]
@@ -298,6 +303,139 @@ class RequestLog:
             "upstream_model": row[14],
             "truncated": bool(row[15]),
         }
+
+    @staticmethod
+    def _group_id_expr() -> str:
+        return "CASE WHEN logical_id != '' THEN logical_id ELSE req_id END"
+
+    @staticmethod
+    def _attempt_row(row: tuple) -> dict:
+        return {
+            "req_id": row[0],
+            "logical_id": row[1],
+            "ts": row[2],
+            "endpoint": row[3],
+            "model": row[4],
+            "provider": row[5],
+            "key": row[6],
+            "client": row[7],
+            "status": row[8],
+            "status_code": row[9],
+            "latency_ms": row[10],
+            "upstream_model": row[11],
+            "error": row[12],
+        }
+
+    @staticmethod
+    def _group_summary(attempts: list[dict]) -> dict:
+        first = attempts[0]
+        final = attempts[-1]
+        return {
+            "group_id": first.get("logical_id") or first["req_id"],
+            "logical_id": first.get("logical_id", ""),
+            "req_id": final["req_id"],
+            "ts": first["ts"],
+            "finished_at": final["ts"],
+            "endpoint": first.get("endpoint", ""),
+            "model": first.get("model", ""),
+            "client": first.get("client", ""),
+            "provider": final.get("provider") or "",
+            "status": final.get("status"),
+            "status_code": final.get("status_code"),
+            "latency_ms": round(sum(float(item.get("latency_ms") or 0) for item in attempts), 3),
+            "attempt_count": len(attempts),
+            "providers": list(dict.fromkeys(
+                item["provider"] for item in attempts if item.get("provider")
+            )),
+            "attempts": attempts,
+        }
+
+    def groups(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        model: str | None = None,
+        status: str | None = None,
+        client: str | None = None,
+    ) -> list[dict]:
+        """List logical requests and all of their provider/key attempts."""
+        group_expr = self._group_id_expr()
+        where: list[str] = []
+        params: list = []
+        if model:
+            where.append("model = ?")
+            params.append(model)
+        if client:
+            where.append("client = ?")
+            params.append(client)
+        where_sql = " WHERE " + " AND ".join(where) if where else ""
+        sql = (
+            f"WITH grouped AS (SELECT {group_expr} AS group_id, MAX(id) AS last_id "
+            f"FROM requests{where_sql} GROUP BY group_id) "
+            "SELECT grouped.group_id FROM grouped JOIN requests final ON final.id=grouped.last_id"
+        )
+        if status:
+            sql += " WHERE final.status=?"
+            params.append(status)
+        sql += " ORDER BY grouped.last_id DESC LIMIT ? OFFSET ?"
+        params += [limit, offset]
+        if self._writer is not None:
+            rows = self._writer.query(sql, tuple(params))
+        else:
+            with self._lock:
+                rows = self._conn.execute(sql, tuple(params)).fetchall()
+        group_ids = [str(row[0]) for row in rows]
+        if not group_ids:
+            return []
+        placeholders = ",".join("?" for _ in group_ids)
+        details_sql = (
+            "SELECT req_id,logical_id,ts,endpoint,model,provider,key_label,client,status,status_code,"
+            "latency_ms,upstream_model,error FROM requests "
+            f"WHERE {group_expr} IN ({placeholders}) ORDER BY id ASC"
+        )
+        if self._writer is not None:
+            detail_rows = self._writer.query(details_sql, tuple(group_ids))
+        else:
+            with self._lock:
+                detail_rows = self._conn.execute(details_sql, tuple(group_ids)).fetchall()
+        by_group: dict[str, list[dict]] = {group_id: [] for group_id in group_ids}
+        for row in detail_rows:
+            attempt = self._attempt_row(row)
+            group_id = attempt.get("logical_id") or attempt["req_id"]
+            by_group.setdefault(group_id, []).append(attempt)
+        return [
+            self._group_summary(by_group[group_id])
+            for group_id in group_ids
+            if by_group.get(group_id)
+        ]
+
+    def group(self, group_id: str) -> dict | None:
+        """Return one logical request, its attempt chain, and replayable bodies."""
+        group_expr = self._group_id_expr()
+        sql = (
+            "SELECT req_id,logical_id,ts,endpoint,model,provider,key_label,client,status,status_code,"
+            "latency_ms,upstream_model,error,request_json,response_json,truncated FROM requests "
+            f"WHERE {group_expr}=? ORDER BY id ASC"
+        )
+        if self._writer is not None:
+            rows = self._writer.query(sql, (str(group_id),))
+        else:
+            with self._lock:
+                rows = self._conn.execute(sql, (str(group_id),)).fetchall()
+        if not rows:
+            return None
+        attempts: list[dict] = []
+        for row in rows:
+            attempt = self._attempt_row(row[:13])
+            attempt["request"] = json.loads(row[13]) if row[13] else None
+            attempt["response"] = json.loads(row[14]) if row[14] else None
+            attempt["truncated"] = bool(row[15])
+            attempts.append(attempt)
+        result = self._group_summary(attempts)
+        result["request"] = attempts[0].get("request")
+        result["response"] = attempts[-1].get("response")
+        result["truncated"] = any(item.get("truncated") for item in attempts)
+        return result
 
     def count_requests(self, client: str | None = None, since: float | None = None) -> int:
         """统计逻辑请求数（按 logical_id 去重，重试共享同一 logical_id 只算 1 次）。"""
