@@ -8,6 +8,7 @@ config.yaml
 *.db
 *.db-wal
 *.db-shm
+*.master-key
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
