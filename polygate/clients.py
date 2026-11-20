@@ -7,7 +7,7 @@
   支持热重载（走 ``RuntimeState.reload``，无需重启）。
 * 模型白名单：每个 Key 只能调用允许的模型。
 * 配额：RPM（内存令牌桶，进程内即时生效）、日调用数、月调用数（查请求日志库）。
-* 预算：月累计成本上限（查成本库；与 ``pricing`` 同币种）。
+* 预算：月累计成本上限；配置 SQLite 时在调用上游前原子预占，与 ``pricing`` 同币种。
 * 用量：内存统计（``Stats.calls_by_client``）+ 持久化（requests/costs 表的
   ``client`` 列），面板与 ``/v1/status`` 可见。
 
@@ -21,6 +21,8 @@ import threading
 import time
 from dataclasses import dataclass, field
 
+from .budget import BudgetLedger, estimate_cost_upper_bound
+
 
 @dataclass
 class ClientPolicy:
@@ -33,6 +35,9 @@ class ClientPolicy:
     daily_calls: int = 0  # 每日逻辑请求上限，0 = 不限
     monthly_calls: int = 0  # 每月逻辑请求上限，0 = 不限
     monthly_budget: float = 0  # 每月成本上限（pricing 同币种），0 = 不限
+    id: str = ""  # 托管虚拟 Key ID；兼容 YAML 时为空
+    key_prefix: str = ""  # 只用于管理面板识别，不是完整 Key
+    expires_at: float | None = None
 
 
 def parse_client_keys(auth_cfg: dict | None) -> dict[str, ClientPolicy]:
@@ -96,19 +101,19 @@ class QuotaChecker:
     明确标注，避免运营误以为配额生效。
     """
 
-    def __init__(self, limiter=None, store=None, cost=None):
+    def __init__(self, limiter=None, store=None, cost=None, budget: BudgetLedger | None = None):
         self._limiter = limiter
         self._store = store
         self._cost = cost
+        self._budget = budget
         self._usage_lock = threading.Lock()
         self._usage_cache: dict[str, dict] = {}
 
     def _usage_for(self, client: str, refresh: bool = False) -> dict:
-        """Load persistent usage once per client/day/month, then use counters.
+        """按客户端/日/月加载持久化调用统计，再在进程内累加。
 
-        Reservations make concurrent requests in this process count before any
-        upstream call. Multiple workers still require a shared quota backend
-        for a globally exact limit; the HTTP status endpoint states this.
+        日/月调用次数的进程内缓存不是跨进程原子计数器；预算则另走
+        :class:`BudgetLedger`，通过共享 SQLite 租约保证跨进程预占原子性。
         """
         day = _day_start_ts()
         month = _month_start_ts()
@@ -141,13 +146,73 @@ class QuotaChecker:
                 return f"client daily quota exceeded ({usage['daily']}/{policy.daily_calls})"
             if policy.monthly_calls > 0 and usage["monthly"] >= policy.monthly_calls:
                 return f"client monthly quota exceeded ({usage['monthly']}/{policy.monthly_calls})"
-            if policy.monthly_budget > 0 and usage["spent"] >= policy.monthly_budget:
+            if self._budget is None and policy.monthly_budget > 0 and usage["spent"] >= policy.monthly_budget:
                 return f"client monthly budget exceeded ({usage['spent']:.4f}/{policy.monthly_budget:g})"
             # Failed calls still consume a logical request quota, matching the
             # pre-existing request-log based semantics.
             usage["daily"] += 1
             usage["monthly"] += 1
         return None
+
+    def reserve_budget(
+        self,
+        policy: ClientPolicy,
+        client: str,
+        model: str,
+        payload: dict,
+        pricing: dict,
+        settings: dict | None,
+        *,
+        completion_is_relevant: bool = True,
+    ) -> tuple[str | None, dict | None, dict]:
+        """按成本上限预占预算；返回 (拒绝原因, ticket, 当前用量)。"""
+        if self._budget is None or policy is None or not policy.monthly_budget or policy.monthly_budget <= 0:
+            return None, None, {}
+        cfg = settings or {}
+        estimate = estimate_cost_upper_bound(
+            payload,
+            pricing,
+            model,
+            default_max_output_tokens=int(cfg.get("default_max_output_tokens", 4096)),
+            bytes_per_token=float(cfg.get("bytes_per_token", 2.0)),
+            completion_is_relevant=completion_is_relevant,
+        )
+        period = _month_start_ts()
+        baseline = self._cost.spend_since(client=client, since=period) if self._cost is not None else 0.0
+        if estimate <= 0:
+            info = self._budget.usage(client, period, baseline)
+            return None, None, info
+        reservation = self._budget.reserve(
+            client=client,
+            period_start=period,
+            limit=policy.monthly_budget,
+            reserved_cost=estimate,
+            baseline_cost=baseline,
+            ttl_seconds=float(cfg.get("reservation_ttl", 900.0)),
+        )
+        info = {
+            "used": reservation.used,
+            "limit": reservation.limit,
+            "reserved": reservation.reserved,
+            "estimate": estimate,
+        }
+        if reservation.reason or reservation.lease is None:
+            return reservation.reason or "client monthly budget exceeded", None, info
+        return None, {
+            "id": reservation.lease.id,
+            "reserved": reservation.lease.reserved_cost,
+            "expires_at": reservation.lease.expires_at,
+        }, info
+
+    def settle_budget(self, ticket: dict | None, actual_cost: float) -> None:
+        if self._budget is None or not ticket:
+            return
+        self._budget.settle(str(ticket.get("id") or ""), max(0.0, float(actual_cost)))
+
+    def release_budget(self, ticket: dict | None, actual_cost: float = 0.0) -> None:
+        if self._budget is None or not ticket:
+            return
+        self._budget.settle(str(ticket.get("id") or ""), max(0.0, float(actual_cost)), released=True)
 
     def settle_cost(self, client: str, amount: float) -> None:
         if not client or amount <= 0:
@@ -201,6 +266,13 @@ class QuotaChecker:
             return None
         if self._cost is None:
             return None
+        if self._budget is not None:
+            period = _month_start_ts()
+            baseline = self._cost.spend_since(client=client, since=period)
+            used = self._budget.usage(client, period, baseline)["used"]
+            if used >= policy.monthly_budget:
+                return f"client monthly budget exceeded ({used:.4f}/{policy.monthly_budget:g})"
+            return None
         spent = self._usage_for(client, refresh=True)["spent"]
         if spent >= policy.monthly_budget:
             return f"client monthly budget exceeded ({spent:.4f}/{policy.monthly_budget:g})"
@@ -235,8 +307,19 @@ class QuotaChecker:
                 "limit": policy.monthly_calls,
             }
         if self._cost is not None and policy.monthly_budget:
-            out["monthly_budget"] = {
-                "used": round(usage["spent"], 6),
-                "limit": policy.monthly_budget,
-            }
+            if self._budget is not None:
+                period = _month_start_ts()
+                baseline = self._cost.spend_since(client=client, since=period)
+                budget = self._budget.usage(client, period, baseline)
+                out["monthly_budget"] = {
+                    "used": round(budget["used"], 6),
+                    "settled": round(budget["settled"], 6),
+                    "reserved": round(budget["reserved"], 6),
+                    "limit": policy.monthly_budget,
+                }
+            else:
+                out["monthly_budget"] = {
+                    "used": round(usage["spent"], 6),
+                    "limit": policy.monthly_budget,
+                }
         return out

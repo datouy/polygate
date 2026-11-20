@@ -98,7 +98,7 @@ def merge_config(base: dict, overrides: dict) -> dict:
         for k, v in ov_auth.items():
             auth[k] = copy.deepcopy(v)
 
-    for section in ("alerting", "health", "pricing", "redis"):
+    for section in ("alerting", "health", "pricing", "budget", "redis"):
         if section in overrides and isinstance(overrides[section], dict):
             merged = result.setdefault(section, {})
             if isinstance(merged, dict):
