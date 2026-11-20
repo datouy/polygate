@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import sqlite3
 import threading
@@ -55,6 +56,38 @@ class ConfigStore:
                 (json.dumps(overrides, ensure_ascii=False),),
             )
             self._conn.commit()
+
+    @staticmethod
+    def _revision_of(data: dict) -> str:
+        encoded = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def save_if_revision(self, overrides: dict, expected: str) -> bool:
+        """Persist only if the caller still holds the same revision."""
+        with self._lock:
+            if self._conn is None:
+                current = copy.deepcopy(self._memory)
+            else:
+                row = self._conn.execute("SELECT data FROM config_overrides WHERE id=1").fetchone()
+                try:
+                    current = (json.loads(row[0]) or {}) if row else {}
+                except Exception:
+                    current = {}
+            if self._revision_of(current) != expected:
+                return False
+            if self._conn is None:
+                self._memory = copy.deepcopy(overrides)
+            else:
+                self._conn.execute(
+                    "INSERT INTO config_overrides(id, data) VALUES(1, ?) "
+                    "ON CONFLICT(id) DO UPDATE SET data=excluded.data",
+                    (json.dumps(overrides, ensure_ascii=False),),
+                )
+                self._conn.commit()
+            return True
+
+    def revision(self) -> str:
+        return self._revision_of(self.load())
 
     def close(self) -> None:
         with self._lock:
