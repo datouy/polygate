@@ -14,6 +14,7 @@ class Route:
     provider: str
     model: str
     weight: float = 1.0
+    capabilities: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -34,9 +35,18 @@ class Router:
     def routes_for(self, model: str) -> list[Route]:
         return self.models.get(model, [])
 
-    def candidates(self, model: str) -> list[Candidate]:
+    def candidates(self, model: str, required_capabilities: set[str] | None = None) -> list[Candidate]:
         """返回按优先级排序的候选列表：优先命中权重选中的 Provider，其余作为故障切换备选。"""
         routes = self.models.get(model)
+        if not routes:
+            return []
+
+        required = {str(x).strip().lower() for x in (required_capabilities or set()) if str(x).strip()}
+        if required:
+            routes = [
+                route for route in routes
+                if not route.capabilities or required.issubset(route.capabilities)
+            ]
         if not routes:
             return []
 

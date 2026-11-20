@@ -30,6 +30,13 @@ def build(cfg: dict):
             timeout=float(p.get("timeout", 120.0)),
         )
 
+    def capability_set(value) -> set[str]:
+        if isinstance(value, str):
+            value = value.split(',')
+        if not isinstance(value, (list, tuple, set)):
+            return set()
+        return {str(item).strip().lower() for item in value if str(item).strip()}
+
     models: dict[str, list[Route]] = {}
     model_kinds: dict[str, str] = {}
     for m in (cfg.get("models") or []):
@@ -39,6 +46,9 @@ def build(cfg: dict):
                 provider=r.get("provider"),
                 model=r.get("model"),
                 weight=float(r.get("weight", 1.0)),
+                capabilities=frozenset(
+                    capability_set(m.get("capabilities")) | capability_set(r.get("capabilities"))
+                ),
             )
             for r in (m.get("providers") or [])
             if r.get("provider") and r.get("model")
@@ -230,7 +240,10 @@ class RuntimeState:
                     "name": name,
                     "kind": self.model_kinds.get(name, "chat"),
                     "routes": [
-                        {"provider": r.provider, "model": r.model, "weight": r.weight}
+                        {
+                            "provider": r.provider, "model": r.model,
+                            "weight": r.weight, "capabilities": sorted(r.capabilities),
+                        }
                         for r in routes
                     ],
                 }
