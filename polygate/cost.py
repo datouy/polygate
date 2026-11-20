@@ -122,6 +122,8 @@ class CostTracker:
                 total = self._conn.execute(total_sql, params).fetchone()[0]
                 by_client = self._conn.execute(by_client_sql, params).fetchall()
         return {
+            "scope": "rolling",
+            "window_days": 30,
             "total": round(total, 6),
             "by_key": [
                 {

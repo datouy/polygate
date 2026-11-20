@@ -107,3 +107,50 @@ def test_config_put_adds_model():
         assert r.status_code == 200
         ids = {m["id"] for m in c.get("/v1/models").json()["data"]}
         assert "newm" in ids and "m" in ids
+
+
+def test_config_validate_diff_and_revision_conflict():
+    app = create_app(_cfg())
+    with TestClient(app) as c:
+        current = c.get("/v1/config")
+        assert current.headers["etag"].strip('"') == current.json()["revision"]
+        revision = current.json()["revision"]
+
+        validation = c.post(
+            "/v1/config/validate",
+            json={
+                "revision": revision,
+                "models": [{"name": "m", "providers": [{"provider": "mock", "model": "changed", "weight": 2}]}],
+            },
+        )
+        assert validation.status_code == 200, validation.text
+        assert validation.json()["diff"]
+        assert c.get("/v1/config").json()["revision"] == revision
+
+        saved = c.put(
+            "/v1/config",
+            json={
+                "revision": revision,
+                "models": [{"name": "m", "providers": [{"provider": "mock", "model": "changed", "weight": 2}]}],
+            },
+        )
+        assert saved.status_code == 200, saved.text
+        assert saved.json()["revision"] != revision
+
+        stale = c.put(
+            "/v1/config",
+            json={"revision": revision, "budget": {"reservation_ttl": 60}},
+        )
+        assert stale.status_code == 409
+
+
+def test_config_rejects_invalid_typed_patch():
+    app = create_app(_cfg())
+    with TestClient(app) as c:
+        bad_url = c.put("/v1/config", json={"providers": {"mock": {"base_url": "file:///tmp/x"}}})
+        assert bad_url.status_code == 422
+        unknown = c.put(
+            "/v1/config",
+            json={"models": [{"name": "bad", "providers": [{"provider": "missing", "model": "bad"}]}]},
+        )
+        assert unknown.status_code == 400

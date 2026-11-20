@@ -4,6 +4,8 @@
 
 # SQLite 用量持久化（留空或删除则禁用持久化）
 db_path: polygate.db
+# Provider 上游 Key 在 SQLite 覆盖中使用加密密文。生产环境建议设置
+# POLYGATE_MASTER_KEY（32 字节以上随机值）；未设置时会生成 db_path.master-key。
 
 # 流式请求自动注入 stream_options.include_usage（用于统计流式 token/成本）。
 # 部分国产厂商（DashScope/GLM 等）可能不兼容该字段；关闭后流式 token 将记为 0。
@@ -17,23 +19,22 @@ limits:
   total_timeout: 180     # 整个请求（含重试）总超时（秒）
   max_attempts: 8        # 最多尝试 Provider × Key 候选数
   retry_backoff: 0.15    # 重试基础退避（秒），带随机抖动，指数封顶
+
+# 客户月预算的硬预占账本（仅在 db_path 已配置时生效）。
+# 请求开始前按输入体积 + 最大输出 token 估算成本上限并原子预占，
+# 请求结束后按上游 usage 结算；缺少 usage 时按预占上限保守结算。
+# 这是基于 pricing 的估算，不是精确 tokenizer 上界；多进程共享 SQLite 时仍会原子检查。
+budget:
+  default_max_output_tokens: 4096  # 请求未指定 max_tokens 时的保守输出上限
+  bytes_per_token: 2.0             # 估算宽度；值越小预占越保守
+  reservation_ttl: 900             # 异常中断预占的自动失效时间（秒，应大于 total_timeout）
 auth:
   # 保护你的网关入口。设置后，客户端必须带请求头 Authorization: Bearer <api_key>
   api_key: "change-me"
   # /v1/usage、/v1/status、/admin 等管理端口的独立密钥（留空则复用 api_key）
   admin_key: ""
-  # 虚拟 Key（多业务方治理）：每个业务方独立 Key + 白名单 + 配额 + 预算
-  # client 名取 name（留空则取 Key 脱敏，如 sk-b…1234），配额统计按 client 名聚合
-  # 热重载生效（PUT /v1/config 或改 yaml 后 POST /v1/config/reload）
-  client_keys: []  # 示例见下方注释：取消注释并填写后即生效
-    # - key: "sk-biz-a"
-    #   name: "业务A"
-    #   models: ["deepseek-chat"]  # 白名单，空 = 允许全部模型
-    #   rpm: 60                    # 每分钟请求上限（内存令牌桶），0 = 不限
-    #   rpm_burst: 120             # 突发上限，0 = 取 rpm
-    #   daily_calls: 10000         # 每日逻辑请求上限（查 SQLite），0 = 不限
-    #   monthly_calls: 200000      # 每月逻辑请求上限，0 = 不限
-    #   monthly_budget: 50.0       # 每月成本上限（与 pricing 同币种），0 = 不限
+  # 虚拟 Key 在管理面板“设置”中创建，只存 SHA-256 哈希和短前缀。
+  # 旧版 client_keys 明文配置会在启动时自动迁移并从覆盖中删除。
 # 告警通知（可选）：熔断打开 / 配额超限时推送到 Webhook（企微 / 钉钉 / Slack 通用 JSON）
 # 未配置 webhook_url 时为静默空操作，不影响业务。同一事件 cooldown 秒内只发一次。
 alerting:
@@ -116,9 +117,11 @@ models:
 
   # 多 Provider 故障切换示例：优先 deepseek（权重 3），失败自动切 qwen（权重 1）
   - name: chat-fallback
+    # capabilities 可以写在模型级（应用到全部路由）或每个 provider 路由级。
+    # 未声明 capabilities 的路由视为兼容全部请求；声明后只在满足工具/JSON/视觉等要求时使用。
     providers:
-      - { provider: deepseek, model: deepseek-chat, weight: 3 }
-      - { provider: qwen, model: qwen-plus, weight: 1 }
+      - { provider: deepseek, model: deepseek-chat, weight: 3 }  # 可加 capabilities: [stream, tools, json]
+      - { provider: qwen, model: qwen-plus, weight: 1 }         # 可加 capabilities: [stream, tools]
 
   # Embeddings 模型（kind: embeddings，走 /v1/embeddings 统一转发）
   - name: qwen-text-embedding-v3

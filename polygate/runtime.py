@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from .alerts import Alerter
 from .circuit import CircuitBreaker, KeyBreaker
-from .clients import parse_client_keys
+from .clients import ClientPolicy, parse_client_keys
 from .providers import Provider
 from .ratelimit import RateLimiter
 from .redislimiter import RedisRateLimiter
 from .router import Route, Router
+from .virtualkeys import ManagedClientKey, hash_client_key
 
 
 def build(cfg: dict):
@@ -32,7 +34,7 @@ def build(cfg: dict):
 
     def capability_set(value) -> set[str]:
         if isinstance(value, str):
-            value = value.split(',')
+            value = value.split(",")
         if not isinstance(value, (list, tuple, set)):
             return set()
         return {str(item).strip().lower() for item in value if str(item).strip()}
@@ -95,6 +97,7 @@ class RuntimeState:
         model_kinds: dict
         rate_limits: dict
         pricing: dict
+        budget: dict
         router: Router
         health_enabled: bool
         health_interval: float
@@ -103,7 +106,6 @@ class RuntimeState:
         gateway_key: str | None
         admin_key: str | None
         client_keys: dict
-        client_headers: dict
         alerter: Alerter | None
         limiter: object
         stream_include_usage: bool
@@ -112,9 +114,9 @@ class RuntimeState:
         max_attempts: int
         retry_backoff: float
 
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, managed_client_keys: list[ManagedClientKey] | None = None):
         self._redis_cfg_signature: object = object()
-        self.reload(cfg)
+        self.reload(cfg, managed_client_keys)
 
     def __getattr__(self, name):
         # Reads outside a request (health loop, admin) always use one snapshot.
@@ -122,13 +124,33 @@ class RuntimeState:
             raise AttributeError(name)
         return getattr(self.current, name)
 
-    def reload(self, cfg: dict) -> None:
+    def reload(self, cfg: dict, managed_client_keys: list[ManagedClientKey] | None = None) -> None:
         previous = getattr(self, "current", None)
         old_circuits = previous.circuits if previous else {}
         old_key_breakers = previous.key_breakers if previous else {}
         old_limiter = previous.limiter if previous else None
         old_alerter = previous.alerter if previous else None
         (providers, models, model_kinds, rate_limits, pricing) = build(cfg)
+        raw_budget = cfg.get("budget") or {}
+        if not isinstance(raw_budget, dict):
+            raise ValueError("budget must be an object")
+        try:
+            budget = {
+                "default_max_output_tokens": int(raw_budget.get("default_max_output_tokens", 4096)),
+                "bytes_per_token": float(raw_budget.get("bytes_per_token", 2.0)),
+                "reservation_ttl": float(raw_budget.get("reservation_ttl", 900.0)),
+            }
+        except (TypeError, ValueError):
+            raise ValueError(
+                "budget.default_max_output_tokens/bytes_per_token/reservation_ttl must be numeric"
+            ) from None
+        if (
+            budget["default_max_output_tokens"] <= 0
+            or budget["bytes_per_token"] <= 0
+            or budget["reservation_ttl"] <= 0
+            or not all(math.isfinite(budget[key]) for key in ("bytes_per_token", "reservation_ttl"))
+        ):
+            raise ValueError("budget values must be positive")
         router = Router(providers, models)
 
         health_cfg = cfg.get("health") or {}
@@ -169,8 +191,14 @@ class RuntimeState:
         auth = cfg.get("auth") or {}
         gateway_key = auth.get("api_key") or None
         admin_key = auth.get("admin_key") or gateway_key
-        client_keys = parse_client_keys(auth)
-        client_headers = {f"Bearer {key}": pol for key, pol in client_keys.items()}
+        client_keys: dict[str, ClientPolicy] = {}
+        for raw_key, policy in parse_client_keys(auth).items():
+            policy.key_prefix = policy.key_prefix or mask_key(raw_key)
+            client_keys[hash_client_key(raw_key)] = policy
+        for record in managed_client_keys or []:
+            if record.revoked_at:
+                continue
+            client_keys[record.key_hash] = record.policy()
 
         # 告警：仅在 webhook 变化时重建，避免热重载重复创建/丢连接。
         alert_cfg = cfg.get("alerting") or {}
@@ -212,10 +240,10 @@ class RuntimeState:
         # requests.  A failed build above leaves the previous snapshot intact.
         self.current = self.Snapshot(
             providers=providers, models=models, model_kinds=model_kinds,
-            rate_limits=rate_limits, pricing=pricing, router=router,
+            rate_limits=rate_limits, pricing=pricing, budget=budget, router=router,
             health_enabled=health_enabled, health_interval=health_interval,
             circuits=circuits, key_breakers=key_breakers, gateway_key=gateway_key,
-            admin_key=admin_key, client_keys=client_keys, client_headers=client_headers,
+            admin_key=admin_key, client_keys=client_keys,
             alerter=alerter, limiter=limiter, stream_include_usage=stream_include_usage,
             log_retention_days=log_retention_days, total_timeout=total_timeout,
             max_attempts=max_attempts, retry_backoff=retry_backoff,
@@ -249,6 +277,7 @@ class RuntimeState:
                 }
                 for name, routes in self.models.items()
             ],
+            "budget": dict(self.budget),
             "presets": {
                 "deepseek": "https://api.deepseek.com",
                 "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1",
