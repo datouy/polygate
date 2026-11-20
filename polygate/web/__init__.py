@@ -1,0 +1,1 @@
+"""Bundled administration interface assets."""

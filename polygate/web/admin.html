@@ -1,0 +1,483 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#f7f7f4">
+  <title>polygate</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/admin/assets/admin.css">
+  <script src="/admin/assets/admin.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main" data-action="skip-main">跳到内容</a>
+
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar" aria-label="工作区">
+      <a class="brand" href="#overview" aria-label="polygate 总览">
+        <svg class="brand-mark" width="22" height="22" viewBox="0 0 22 22" aria-hidden="true">
+          <path d="M4 4.5h14M4 11h9M4 17.5h14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+          <circle cx="17" cy="11" r="1.5" fill="currentColor"/>
+        </svg>
+        <span>polygate</span>
+      </a>
+
+      <nav class="nav" aria-label="主导航">
+        <a class="nav-item" href="#overview" data-page="overview">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 10.5 8 5l4 4 5-5M3 16h5M12 16h5"/></svg>
+          <span>总览</span>
+        </a>
+        <a class="nav-item" href="#routing" data-page="routing">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 5h5l4 5h5M3 15h5l4-5"/><circle cx="16.5" cy="5" r="1.2"/><circle cx="16.5" cy="15" r="1.2"/></svg>
+          <span>路由</span>
+        </a>
+        <a class="nav-item" href="#usage" data-page="usage">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 16V9m5 7V4m5 12v-5m4 5V6"/></svg>
+          <span>用量与成本</span>
+        </a>
+        <a class="nav-item" href="#requests" data-page="requests">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 3h12v14H4zM7 7h6M7 10h6M7 13h4"/></svg>
+          <span>请求</span>
+        </a>
+        <a class="nav-item" href="#diagnostics" data-page="diagnostics">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 3 17 7v6l-7 4-7-4V7zM7 10l1.8 1.8L13 7.5"/></svg>
+          <span>诊断</span>
+        </a>
+        <a class="nav-item" href="#settings" data-page="settings">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="2.5"/><path d="M10 3v2M10 15v2M3 10h2M15 10h2M5 5l1.4 1.4M13.6 13.6 15 15M15 5l-1.4 1.4M6.4 13.6 5 15"/></svg>
+          <span>设置</span>
+        </a>
+      </nav>
+
+      <div class="sidebar-footer">
+        <button class="nav-item full-width" type="button" data-action="open-key">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="7" cy="10" r="3"/><path d="M10 10h7M14 10v3M16 10v2"/></svg>
+          <span>管理密钥</span>
+        </button>
+        <div class="version-line"><span>版本</span><span id="sidebar-version">—</span></div>
+      </div>
+    </aside>
+
+    <button class="nav-backdrop" type="button" data-action="close-nav" aria-label="关闭导航"></button>
+
+    <div class="workspace">
+      <header class="topbar">
+        <button class="icon-button menu-button" type="button" data-action="open-nav" aria-label="打开导航" aria-controls="sidebar" aria-expanded="false">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 5h14M3 10h14M3 15h14"/></svg>
+        </button>
+        <h1 id="page-title">总览</h1>
+        <div class="topbar-actions">
+          <span class="connection" id="connection" role="status" aria-live="polite">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span class="connection-text">连接中</span>
+          </span>
+          <button class="button secondary" type="button" data-action="refresh">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M15.5 7A6 6 0 1 0 16 12M15.5 7V3.5M15.5 7H12"/></svg>
+            <span>刷新</span>
+          </button>
+        </div>
+      </header>
+
+      <main id="main" tabindex="-1">
+        <section class="view" data-view="overview" aria-labelledby="page-title">
+          <div class="overview-heading">
+            <div>
+              <div class="health-line">
+                <span class="status-dot large" id="overview-dot" aria-hidden="true"></span>
+                <h2 id="overview-health">载入中</h2>
+              </div>
+              <p class="lede" id="overview-detail">—</p>
+            </div>
+            <dl class="uptime">
+              <dt>运行时间</dt>
+              <dd id="overview-uptime">—</dd>
+            </dl>
+          </div>
+
+          <div class="metric-strip" aria-label="当前进程指标">
+            <article class="metric">
+              <span>本进程请求</span>
+              <strong id="metric-requests">—</strong>
+            </article>
+            <article class="metric">
+              <span>本进程 Tokens</span>
+              <strong id="metric-tokens">—</strong>
+            </article>
+            <article class="metric">
+              <span id="metric-cost-label">30 天成本</span>
+              <strong id="metric-cost">—</strong>
+            </article>
+            <article class="metric">
+              <span>本进程错误率</span>
+              <strong id="metric-errors">—</strong>
+            </article>
+          </div>
+
+          <div class="overview-grid">
+            <section class="panel chart-panel" aria-labelledby="overview-chart-title">
+              <div class="section-heading">
+                <h2 id="overview-chart-title">最近 7 天</h2>
+                <span id="overview-chart-total">—</span>
+              </div>
+              <div class="chart" id="overview-chart" role="img" aria-label="最近 7 天请求数"></div>
+            </section>
+
+            <section class="panel" aria-labelledby="attention-title">
+              <div class="section-heading">
+                <h2 id="attention-title">待处理</h2>
+                <span id="attention-count">0</span>
+              </div>
+              <div class="plain-list" id="attention-list"></div>
+            </section>
+          </div>
+
+          <section class="panel" aria-labelledby="overview-routes-title">
+            <div class="section-heading">
+              <h2 id="overview-routes-title">模型路由</h2>
+              <a class="text-link" href="#routing">全部</a>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <caption class="sr-only">模型路由摘要</caption>
+                <thead><tr><th>模型</th><th>类型</th><th>路由</th><th>能力</th></tr></thead>
+                <tbody id="overview-models"><tr><td colspan="4" class="empty">载入中</td></tr></tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+
+        <section class="view" data-view="routing" aria-labelledby="page-title" hidden>
+          <div class="page-toolbar">
+            <p class="page-summary" id="routing-summary">—</p>
+            <div class="toolbar-actions">
+              <button class="button secondary" id="new-model" type="button">新建模型</button>
+              <a class="button secondary" href="#diagnostics">兼容性检查</a>
+            </div>
+          </div>
+
+          <section class="panel" aria-labelledby="providers-title">
+            <div class="section-heading"><h2 id="providers-title">Provider</h2><span id="provider-count">—</span></div>
+            <div class="table-wrap">
+              <table>
+                <caption class="sr-only">Provider 状态</caption>
+                <thead><tr><th>名称</th><th>状态</th><th>密钥</th><th>连续失败</th><th>限流</th></tr></thead>
+                <tbody id="providers-body"><tr><td colspan="5" class="empty">载入中</td></tr></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="panel" aria-labelledby="models-title">
+            <div class="section-heading"><h2 id="models-title">模型</h2><span id="model-count">—</span></div>
+            <div class="table-wrap">
+              <table>
+                <caption class="sr-only">模型与上游路由</caption>
+                <thead><tr><th>模型</th><th>类型</th><th>上游路由</th><th>能力</th><th></th></tr></thead>
+                <tbody id="models-body"><tr><td colspan="5" class="empty">载入中</td></tr></tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+
+        <section class="view" data-view="usage" aria-labelledby="page-title" hidden>
+          <div class="metric-strip usage-metrics" aria-label="累计指标">
+            <article class="metric"><span>本进程请求</span><strong id="usage-requests">—</strong></article>
+            <article class="metric"><span>本进程 Tokens</span><strong id="usage-tokens">—</strong></article>
+            <article class="metric"><span id="usage-cost-label">30 天成本</span><strong id="usage-cost">—</strong></article>
+            <article class="metric"><span>本进程 P95</span><strong id="usage-p95">—</strong></article>
+          </div>
+
+          <section class="panel chart-panel" aria-labelledby="history-title">
+            <div class="section-heading">
+              <h2 id="history-title">每日请求</h2>
+              <label class="compact-field">
+                <span class="sr-only">历史范围</span>
+                <select id="history-days">
+                  <option value="7">7 天</option>
+                  <option value="30">30 天</option>
+                  <option value="90">90 天</option>
+                </select>
+              </label>
+            </div>
+            <div class="chart" id="history-chart" role="img" aria-label="每日请求数"></div>
+          </section>
+
+          <section class="panel" aria-labelledby="usage-models-title">
+            <div class="section-heading"><h2 id="usage-models-title">模型</h2></div>
+            <div class="table-wrap">
+              <table>
+                <caption class="sr-only">模型用量</caption>
+                <thead><tr><th>模型</th><th>请求</th><th>错误</th><th>Tokens</th><th>平均延迟</th><th>P95</th></tr></thead>
+                <tbody id="usage-models-body"><tr><td colspan="6" class="empty">载入中</td></tr></tbody>
+              </table>
+            </div>
+          </section>
+
+          <div class="two-column">
+            <section class="panel" aria-labelledby="cost-keys-title">
+              <div class="section-heading"><h2 id="cost-keys-title">按 Key</h2><span id="cost-total">—</span></div>
+              <div class="table-wrap">
+                <table>
+                  <caption class="sr-only">按上游 Key 统计成本</caption>
+                  <thead><tr><th>Key</th><th>成本</th><th>请求</th><th>Tokens</th></tr></thead>
+                  <tbody id="cost-keys-body"><tr><td colspan="4" class="empty">载入中</td></tr></tbody>
+                </table>
+              </div>
+            </section>
+            <section class="panel" aria-labelledby="cost-clients-title">
+              <div class="section-heading"><h2 id="cost-clients-title">按客户端</h2></div>
+              <div class="table-wrap">
+                <table>
+                  <caption class="sr-only">按客户端统计成本</caption>
+                  <thead><tr><th>客户端</th><th>成本</th><th>请求</th><th>Tokens</th></tr></thead>
+                  <tbody id="cost-clients-body"><tr><td colspan="4" class="empty">载入中</td></tr></tbody>
+                </table>
+              </div>
+            </section>
+          </div>
+
+          <section class="panel" aria-labelledby="clients-title">
+            <div class="section-heading"><h2 id="clients-title">客户端配额</h2><span id="quota-state"></span></div>
+            <div class="table-wrap">
+              <table>
+                <caption class="sr-only">客户端配额与预算</caption>
+                <thead><tr><th>客户端</th><th>模型</th><th>RPM</th><th>日请求</th><th>月请求</th><th>月预算</th></tr></thead>
+                <tbody id="clients-body"><tr><td colspan="6" class="empty">载入中</td></tr></tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+
+        <section class="view" data-view="requests" aria-labelledby="page-title" hidden>
+          <form class="filter-bar" id="request-filters">
+            <label class="field"><span>模型</span><input id="filter-model" name="model" autocomplete="off"></label>
+            <label class="field"><span>客户端</span><input id="filter-client" name="client" autocomplete="off"></label>
+            <label class="field"><span>状态</span><select id="filter-status" name="status"><option value="">全部</option><option value="ok">成功</option><option value="error">失败</option></select></label>
+            <button class="button" type="submit">筛选</button>
+          </form>
+
+          <section class="panel flush" aria-labelledby="requests-title">
+            <div class="section-heading inset"><h2 id="requests-title">请求记录</h2><span id="request-page">—</span></div>
+            <div class="table-wrap">
+              <table>
+                <caption class="sr-only">请求记录</caption>
+                <thead><tr><th>时间</th><th>请求</th><th>模型</th><th>Provider</th><th class="hide-small">客户端</th><th>状态</th><th>延迟</th><th></th></tr></thead>
+                <tbody id="requests-body"><tr><td colspan="8" class="empty">载入中</td></tr></tbody>
+              </table>
+            </div>
+            <div class="pagination">
+              <button class="button secondary" id="requests-prev" type="button" disabled>上一页</button>
+              <button class="button secondary" id="requests-next" type="button" disabled>下一页</button>
+            </div>
+          </section>
+        </section>
+
+        <section class="view" data-view="diagnostics" aria-labelledby="page-title" hidden>
+          <section class="panel" aria-labelledby="compat-title">
+            <div class="section-heading"><h2 id="compat-title">Provider 兼容性</h2><span id="compat-time"></span></div>
+            <form class="inline-form" id="compat-form">
+              <label class="field grow"><span>模型</span><input id="compat-models" placeholder="全部" autocomplete="off"></label>
+              <fieldset class="checks">
+                <legend class="sr-only">检测项</legend>
+                <label><input id="probe-chat" type="checkbox" checked>对话</label>
+                <label><input id="probe-stream" type="checkbox" checked>流式 usage</label>
+                <label><input id="probe-tools" type="checkbox">工具</label>
+                <label><input id="probe-json" type="checkbox">JSON</label>
+                <label><input id="probe-models" type="checkbox">/models</label>
+              </fieldset>
+              <button class="button" id="compat-run" type="submit">运行</button>
+            </form>
+            <p class="form-message" id="compat-message" role="status"></p>
+            <div class="table-wrap">
+              <table>
+                <caption class="sr-only">Provider 兼容性结果</caption>
+                <thead><tr><th>Provider</th><th>模型</th><th>上游模型</th><th>检测</th><th>能力</th><th></th></tr></thead>
+                <tbody id="compat-body"><tr><td colspan="6" class="empty">暂无结果</td></tr></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="panel" aria-labelledby="replay-title">
+            <div class="section-heading"><h2 id="replay-title">多模型对比</h2></div>
+            <form class="inline-form" id="replay-form">
+              <label class="field grow"><span>请求 ID</span><input id="replay-id" required autocomplete="off" spellcheck="false"></label>
+              <label class="field grow"><span>目标模型</span><input id="replay-models" placeholder="原模型" autocomplete="off"></label>
+              <label class="check"><input id="replay-response" type="checkbox" checked>返回正文</label>
+              <button class="button" id="replay-run" type="submit">开始</button>
+            </form>
+            <p class="form-message" id="replay-message" role="status"></p>
+            <div class="table-wrap">
+              <table>
+                <caption class="sr-only">多模型重放结果</caption>
+                <thead><tr><th>模型</th><th>Provider</th><th>状态</th><th>延迟</th><th>成本</th><th>结果</th></tr></thead>
+                <tbody id="replay-body"><tr><td colspan="6" class="empty">暂无结果</td></tr></tbody>
+              </table>
+            </div>
+            <details class="raw-details"><summary>原始结果</summary><pre id="replay-json"></pre></details>
+          </section>
+        </section>
+
+        <section class="view" data-view="settings" aria-labelledby="page-title" hidden>
+          <section class="panel" aria-labelledby="settings-providers-title">
+            <div class="section-heading"><h2 id="settings-providers-title">Provider</h2></div>
+            <div class="table-wrap">
+              <table class="responsive-table">
+                <caption class="sr-only">Provider 连接设置</caption>
+                <thead><tr><th>名称</th><th>Base URL</th><th>API Key</th><th>状态</th><th></th></tr></thead>
+                <tbody id="config-providers-body"><tr><td colspan="5" class="empty">载入中</td></tr></tbody>
+              </table>
+            </div>
+            <div class="form-actions">
+              <button class="button" id="save-providers" type="button">保存</button>
+              <button class="button danger-quiet" id="reset-config" type="button">重置配置</button>
+              <span class="form-message" id="config-message" role="status"></span>
+            </div>
+          </section>
+
+          <section class="panel" aria-labelledby="add-provider-title">
+            <div class="section-heading"><h2 id="add-provider-title">添加 Provider</h2></div>
+            <form class="provider-form" id="provider-form">
+              <label class="field"><span>名称</span><input id="new-name" required autocomplete="off" spellcheck="false"></label>
+              <label class="field"><span>预设</span><select id="new-preset"><option value="">自定义</option><option value="deepseek">DeepSeek</option><option value="qwen">通义千问</option><option value="zhipu">智谱 GLM</option><option value="moonshot">Kimi</option><option value="openai">OpenAI</option></select></label>
+              <label class="field wide"><span>Base URL</span><input id="new-url" required type="url" autocomplete="off" spellcheck="false"></label>
+              <label class="field"><span>API Key</span><input id="new-key" type="password" autocomplete="new-password"></label>
+              <label class="field"><span>模型</span><input id="new-model" list="discovered-models" autocomplete="off" spellcheck="false"><datalist id="discovered-models"></datalist></label>
+              <div class="provider-form-actions">
+                <button class="button" type="submit">添加</button>
+                <button class="button secondary" id="test-new-provider" type="button">测试</button>
+                <span class="form-message" id="provider-test-message" role="status"></span>
+              </div>
+            </form>
+          </section>
+
+          <section class="panel" aria-labelledby="client-keys-title">
+            <div class="section-heading">
+              <h2 id="client-keys-title">虚拟 Key</h2>
+              <button class="button secondary" id="new-client-key" type="button">新建</button>
+            </div>
+            <div class="table-wrap">
+              <table class="responsive-table">
+                <caption class="sr-only">虚拟 Key 与配额</caption>
+                <thead><tr><th>名称</th><th>Key</th><th>限制</th><th>最后使用</th><th>状态</th><th></th></tr></thead>
+                <tbody id="client-keys-body"><tr><td colspan="6" class="empty">载入中</td></tr></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="panel" aria-labelledby="budget-title">
+            <div class="section-heading"><h2 id="budget-title">预算</h2></div>
+            <form class="budget-form" id="budget-form">
+              <label class="field"><span>默认输出上限</span><input id="budget-max-output" type="number" min="1" required></label>
+              <label class="field"><span>每 token 字节</span><input id="budget-bytes-token" type="number" min="0.25" step="0.25" required></label>
+              <label class="field"><span>预占 TTL</span><input id="budget-ttl" type="number" min="1" required></label>
+              <button class="button" type="submit">保存</button>
+              <span class="form-message" id="budget-message" role="status"></span>
+            </form>
+          </section>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <dialog class="drawer" id="request-dialog" aria-labelledby="request-dialog-title">
+    <div class="drawer-head">
+      <div><h2 id="request-dialog-title">详情</h2></div>
+      <button class="icon-button" type="button" data-action="close-dialog" aria-label="关闭">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15"/></svg>
+      </button>
+    </div>
+    <div class="drawer-body" id="request-detail"><p class="empty">载入中</p></div>
+    <div class="drawer-actions">
+      <button class="button secondary" type="button" data-action="copy-request-id">复制 ID</button>
+      <button class="button" type="button" data-action="use-in-diagnostics">加入对比</button>
+    </div>
+  </dialog>
+
+  <dialog class="modal" id="key-dialog" aria-labelledby="key-dialog-title">
+    <div class="modal-head">
+      <h2 id="key-dialog-title">管理密钥</h2>
+      <button class="icon-button" type="button" data-action="close-dialog" aria-label="关闭">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15"/></svg>
+      </button>
+    </div>
+    <form class="modal-body" id="key-form">
+      <label class="field"><span>管理密钥</span><input id="admin-key" type="password" autocomplete="current-password" required></label>
+      <p class="form-message" id="key-message" role="status"></p>
+      <div class="form-actions end">
+        <button class="button secondary" type="button" data-action="clear-key">清除</button>
+        <button class="button" type="submit">使用</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="modal" id="client-key-dialog" aria-labelledby="client-key-dialog-title">
+    <div class="modal-head">
+      <h2 id="client-key-dialog-title">虚拟 Key</h2>
+      <button class="icon-button" type="button" data-action="close-dialog" aria-label="关闭">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15"/></svg>
+      </button>
+    </div>
+    <form class="modal-body key-form" id="client-key-form">
+      <div class="form-grid">
+        <label class="field wide"><span>名称</span><input id="client-key-name" required maxlength="80" autocomplete="off"></label>
+        <label class="field wide"><span>模型</span><input id="client-key-models" placeholder="全部" autocomplete="off" spellcheck="false"></label>
+        <label class="field"><span>RPM</span><input id="client-key-rpm" type="number" min="0" value="0"></label>
+        <label class="field"><span>日请求</span><input id="client-key-daily" type="number" min="0" value="0"></label>
+        <label class="field"><span>月请求</span><input id="client-key-monthly" type="number" min="0" value="0"></label>
+        <label class="field"><span>月预算</span><input id="client-key-budget" type="number" min="0" step="0.01" value="0"></label>
+        <label class="field wide"><span>到期</span><input id="client-key-expires" type="date"></label>
+        <label class="field wide"><span>备注</span><input id="client-key-note" maxlength="500" autocomplete="off"></label>
+      </div>
+      <p class="form-message" id="client-key-message" role="status"></p>
+      <div class="form-actions end">
+        <button class="button secondary" type="button" data-action="close-dialog">取消</button>
+        <button class="button" type="submit">保存</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="modal secret-modal" id="client-secret-dialog" aria-labelledby="client-secret-title">
+    <div class="modal-head">
+      <h2 id="client-secret-title">新 Key</h2>
+      <button class="icon-button" type="button" data-action="close-dialog" aria-label="关闭">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <code class="secret-value" id="client-secret-value"></code>
+      <div class="form-actions end">
+        <button class="button" type="button" data-action="copy-client-secret">复制</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog class="modal" id="model-dialog" aria-labelledby="model-dialog-title">
+    <div class="modal-head">
+      <h2 id="model-dialog-title">模型</h2>
+      <button class="icon-button" type="button" data-action="close-dialog" aria-label="关闭">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15"/></svg>
+      </button>
+    </div>
+    <form class="modal-body" id="model-form">
+      <div class="form-grid">
+        <label class="field"><span>名称</span><input id="model-name" required maxlength="200" autocomplete="off" spellcheck="false"></label>
+        <label class="field"><span>类型</span><select id="model-kind"><option value="chat">chat</option><option value="embeddings">embeddings</option><option value="audio">audio</option></select></label>
+      </div>
+      <div class="route-editor">
+        <div class="route-editor-head" aria-hidden="true"><span>Provider</span><span>上游模型</span><span>权重</span><span>能力</span><span></span></div>
+        <div id="model-routes"></div>
+        <button class="row-action" id="add-model-route" type="button">添加路由</button>
+      </div>
+      <div class="config-diff" id="model-diff" hidden></div>
+      <p class="form-message" id="model-message" role="status"></p>
+      <div class="form-actions end">
+        <button class="button secondary" type="button" data-action="close-dialog">取消</button>
+        <button class="button" type="submit">验证</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script id="polygate-ui-state" type="application/json" aria-hidden="true">{}</script>
+</body>
+</html>

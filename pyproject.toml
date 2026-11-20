@@ -30,7 +30,10 @@ Repository = "https://github.com/datouy/polygate"
 Issues = "https://github.com/datouy/polygate/issues"
 
 [tool.setuptools]
-packages = ["polygate"]
+packages = ["polygate", "polygate.web"]
+
+[tool.setuptools.package-data]
+polygate = ["web/*.html", "web/*.css", "web/*.js"]
 
 [tool.setuptools.dynamic]
 version = { attr = "polygate.__version__" }
